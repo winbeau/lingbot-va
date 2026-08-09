@@ -91,11 +91,11 @@ class VA_Server:
                 raise ValueError("Attention analysis currently requires one GPU")
             attention_output = getattr(job_config, 'attention_output', None)
             if attention_output is None:
-                attention_output = os.path.join(self.save_root,
-                                                'attention_analysis')
+                attention_output = 'attn-exp'
             self.attention_recorder = JointAttentionRecorder(
                 output_dir=attention_output,
                 layers=job_config.attention_layers,
+                experiment_name=getattr(job_config, 'prompt', 'prompt-action'),
                 chunk_tokens=job_config.attention_chunk_tokens,
             )
             self.transformer.set_attention_recorder(self.attention_recorder)
@@ -706,14 +706,19 @@ def run(args):
     if args.num_chunks_to_infer is not None:
         config.num_chunks_to_infer = args.num_chunks_to_infer
     config.attention_analysis = args.attention_analysis
-    config.attention_layers = [
-        int(layer) for layer in args.attention_layers.split(',') if layer.strip()
-    ]
+    if args.attention_layers.strip().lower() == 'all':
+        config.attention_layers = list(range(30))
+    else:
+        config.attention_layers = [
+            int(layer) for layer in args.attention_layers.split(',') if layer.strip()
+        ]
     config.attention_output = args.attention_output
     config.attention_chunk_tokens = args.attention_chunk_tokens
     if config.attention_analysis:
         if config.infer_mode != 'i2va':
             raise ValueError("Attention analysis currently supports i2va mode only")
+        if config.num_chunks_to_infer <= 0:
+            raise ValueError("num_chunks_to_infer must be positive")
         if not config.attention_layers:
             raise ValueError("At least one attention layer is required")
         if config.attention_chunk_tokens <= 0:
@@ -774,19 +779,19 @@ def main():
     parser.add_argument(
         "--attention-analysis",
         action='store_true',
-        help='capture low-memory video-action joint attention summaries',
+        help='capture concatenated video-to-video history attention CSVs',
     )
     parser.add_argument(
         "--attention-layers",
         type=str,
-        default='0,14,29',
-        help='comma-separated self-attention layer indices',
+        default='all',
+        help="'all' or comma-separated self-attention layer indices",
     )
     parser.add_argument(
         "--attention-output",
         type=str,
         default=None,
-        help='attention JSON and heatmap output directory',
+        help='attention CSV root; default is attn-exp',
     )
     parser.add_argument(
         "--attention-chunk-tokens",

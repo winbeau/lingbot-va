@@ -232,20 +232,21 @@ NGPU=1 CONFIG_NAME='robotwin_i2av' bash script/run_launch_va_server_sync.sh
 
 > **GPU Memory Requirements**: Approximately **18GB VRAM** for single-GPU i2av inference with offload mode enabled (VAE and text_encoder offloaded to CPU).
 
-#### Video-Action Joint Attention Analysis
+#### Video-to-Video History Attention Analysis
 
-The analysis probe uses Pyramid-Forcing's two-pass chunked softmax method. It keeps only a `Q × K_chunk` score block and immediately aggregates probability mass by modality and frame, rather than saving full token-level attention matrices. Generate at least two chunks to observe both `action → video` and subsequent `video → action` attention:
+The probe uses Pyramid-Forcing's two-pass chunked softmax method. For every generated video chunk, it extracts current-video Q to all visible video-history K while retaining the complete video/action KV softmax denominator. It then concatenates current-Q rows across chunks and writes one CSV for every selected layer and head:
 
 ```bash
-NGPU=1 CONFIG_NAME='robotwin_i2av' uv run bash script/run_launch_va_server_sync.sh \
+CUDA_VISIBLE_DEVICES=1 NGPU=1 CONFIG_NAME='robotwin_i2av' \
+  uv run bash script/run_launch_va_server_sync.sh \
   --model-path /root/wenbiao_zhao/models/lingbot-va-posttrain-robotwin \
   --num-chunks-to-infer 2 \
   --attention-analysis \
-  --attention-layers 0,14,29 \
-  --save_root train_out/robotwin-attention
+  --attention-layers all \
+  --attention-output attn-exp
 ```
 
-The probe writes `summary.json`, modality heatmaps, and per-layer frame heatmaps to `train_out/robotwin-attention/attention_analysis/`.
+Outputs follow `attn-exp/<prompt-action-slug>/lXXhXX.csv`. CSV rows are chronological current-video Q tokens, columns are chronological video-history K tokens, and future keys that were unavailable to an earlier chunk are empty fields. `summary.json` records the logical matrix shape, chunk boundaries, and token coordinates. With all 30 layers and 24 heads, the run creates 720 CSV files.
 
 
 ## Post-Training LingBot-VA
