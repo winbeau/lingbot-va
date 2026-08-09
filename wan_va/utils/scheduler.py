@@ -48,6 +48,7 @@ class FlowMatchScheduler():
                                          num_inference_steps)
         if self.inverse_timesteps:
             self.sigmas = torch.flip(self.sigmas, dims=[0])
+        self.raw_sigmas = self.sigmas.clone()
         if self.exponential_shift:
             mu = self.calculate_shift(
                 dynamic_shift_len
@@ -75,17 +76,21 @@ class FlowMatchScheduler():
         else:
             self.training = False
 
-    def step(self, model_output, timestep, sample, to_final=False, **kwargs):
+    def get_step_sigmas(self, timestep, to_final=False):
         if isinstance(timestep, torch.Tensor):
             timestep = timestep.cpu()
         timestep_id = torch.argmin((self.timesteps - timestep).abs())
         sigma = self.sigmas[timestep_id]
         if to_final or timestep_id + 1 >= len(self.timesteps):
-            sigma_ = 1 if (self.inverse_timesteps
-                           or self.reverse_sigmas) else 0
+            sigma_next = 1 if (self.inverse_timesteps
+                               or self.reverse_sigmas) else 0
         else:
-            sigma_ = self.sigmas[timestep_id + 1]
-        prev_sample = sample + model_output * (sigma_ - sigma)
+            sigma_next = self.sigmas[timestep_id + 1]
+        return sigma, sigma_next
+
+    def step(self, model_output, timestep, sample, to_final=False, **kwargs):
+        sigma, sigma_next = self.get_step_sigmas(timestep, to_final=to_final)
+        prev_sample = sample + model_output * (sigma_next - sigma)
         return prev_sample
 
     def return_to_timestep(self, timestep, sample, sample_stablized):

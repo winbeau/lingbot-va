@@ -1,4 +1,5 @@
 # Copyright 2024-2025 The Robbyant Team Authors. All rights reserved.
+import logging
 import math
 from copy import deepcopy
 
@@ -432,6 +433,7 @@ class WanAttention(torch.nn.Module):
         token_frame_ids=None,
         attention_step_index=None,
         attention_timestep=None,
+        inference_trace=None,
     ):
         kv_cache = self.attn_caches[
             cache_name] if (self.attn_caches is not None) and (cache_name in self.attn_caches) else None
@@ -491,6 +493,48 @@ class WanAttention(torch.nn.Module):
             value = value_pool[:, valid]
             key_token_types = self.attn_caches[cache_name]['token_type'][valid]
             key_frame_ids = self.attn_caches[cache_name]['frame_id'][valid]
+
+        if inference_trace is not None:
+            def token_count(token_types, value):
+                return int((token_types == value).sum().item())
+
+            def token_span(token_types, value):
+                indices = (token_types == value).nonzero(as_tuple=False).squeeze(-1)
+                if indices.numel() == 0:
+                    return "none"
+                return f"{int(indices.min().item())}:{int(indices.max().item()) + 1}"
+
+            q_video = token_count(query_token_types, 0)
+            q_action = token_count(query_token_types, 1)
+            k_video = token_count(key_token_types, 0)
+            k_action = token_count(key_token_types, 1)
+            regions = []
+            if q_video and k_video:
+                regions.append("VV")
+            if q_video and k_action:
+                regions.append("VA")
+            if q_action and k_video:
+                regions.append("AV")
+            if q_action and k_action:
+                regions.append("AA")
+            logging.getLogger().info(
+                "[INFERENCE_AUDIT][ATTENTION] "
+                f"global_forward={inference_trace['global_forward']} "
+                f"chunk={inference_trace['chunk']} "
+                f"phase={inference_trace['phase']} "
+                f"step={inference_trace['step']} "
+                f"layer={inference_trace['layer']} "
+                f"timestep={inference_trace['timestep']:.6f} "
+                f"q_shape={tuple(query.shape)} k_shape={tuple(key.shape)} "
+                f"q_video={q_video} q_action={q_action} "
+                f"k_video={k_video} k_action={k_action} "
+                f"q_video_span={token_span(query_token_types, 0)} "
+                f"q_action_span={token_span(query_token_types, 1)} "
+                f"k_video_span={token_span(key_token_types, 0)} "
+                f"k_action_span={token_span(key_token_types, 1)} "
+                f"regions={','.join(regions) or 'none'} "
+                f"update_cache={update_cache} cache_active={kv_cache is not None}"
+            )
 
         if self.attention_recorder is not None:
             self.attention_recorder.capture(
@@ -579,6 +623,7 @@ class WanTransformerBlock(nn.Module):
         token_frame_ids=None,
         attention_step_index=None,
         attention_timestep=None,
+        inference_trace=None,
     ) -> torch.Tensor:
         temb_scale_shift_table = self.scale_shift_table[None] + temb.float()
         shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = \
@@ -602,7 +647,8 @@ class WanTransformerBlock(nn.Module):
                                  token_type=token_type,
                                  token_frame_ids=token_frame_ids,
                                  attention_step_index=attention_step_index,
-                                 attention_timestep=attention_timestep)
+                                 attention_timestep=attention_timestep,
+                                 inference_trace=inference_trace)
         hidden_states = (hidden_states.float() +
                          attn_output * gate_msa).type_as(hidden_states)
 
@@ -874,6 +920,8 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         train_mode=False,
         attention_step_index=None,
         attention_timestep=None,
+        inference_trace=None,
+        inference_audit_layers=None,
     ):
         r"""
         Forward pass through the diffusion model
@@ -929,7 +977,31 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
 
         token_type = 1 if action_mode else 0
         token_frame_ids = torch.floor(latent_grid_id[:, 0, :]).to(torch.long)
-        for block in self.blocks:
+        audit_layers = set(inference_audit_layers or [])
+        if inference_trace is not None:
+            model_timesteps = sorted({
+                float(value)
+                for value in input_dict['timesteps'].detach().float().cpu().flatten()
+            })
+            logging.getLogger().info(
+                "[INFERENCE_AUDIT][TRANSFORMER] "
+                f"global_forward={inference_trace['global_forward']} "
+                f"chunk={inference_trace['chunk']} "
+                f"phase={inference_trace['phase']} "
+                f"step={inference_trace['step']} "
+                f"scheduler_timestep={inference_trace['timestep']:.6f} "
+                f"model_timestep_values={model_timesteps} "
+                f"action_mode={action_mode} token_type={token_type} "
+                f"input_shape={tuple(input_dict['noisy_latents'].shape)} "
+                f"hidden_shape={tuple(latent_hidden_states.shape)} "
+                f"frame_id_min={int(token_frame_ids.min().item())} "
+                f"frame_id_max={int(token_frame_ids.max().item())} "
+                f"update_cache={update_cache}"
+            )
+        for layer_index, block in enumerate(self.blocks):
+            layer_trace = None
+            if inference_trace is not None and layer_index in audit_layers:
+                layer_trace = {**inference_trace, 'layer': layer_index}
             latent_hidden_states = block(latent_hidden_states,
                                          text_hidden_states,
                                          timestep_proj,
@@ -939,7 +1011,8 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                                          token_type=token_type,
                                          token_frame_ids=token_frame_ids,
                                          attention_step_index=attention_step_index,
-                                         attention_timestep=attention_timestep)
+                                         attention_timestep=attention_timestep,
+                                         inference_trace=layer_trace)
         temb_scale_shift_table = self.scale_shift_table[None] + temb[:, :, None, ...]
         shift, scale = rearrange(temb_scale_shift_table,
                                  'b l n c -> b n l c').chunk(2, dim=1)

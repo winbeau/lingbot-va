@@ -48,6 +48,13 @@ class VA_Server:
         self.dtype = job_config.param_dtype
         self.device = torch.device(f"cuda:{job_config.local_rank}")
         self.enable_offload = getattr(job_config, 'enable_offload', True)  # offload vae & text_encoder to save vram
+        self.inference_audit = (
+            bool(getattr(job_config, 'inference_audit', False))
+            and getattr(job_config, 'rank', 0) == 0
+        )
+        self.inference_audit_layers = list(
+            getattr(job_config, 'inference_audit_layers', [0]))
+        self._audit_forward_index = 0
 
         self.scheduler = FlowMatchScheduler(shift=self.job_config.snr_shift,
                                             sigma_min=0.0,
@@ -410,6 +417,7 @@ class VA_Server:
         #### Reset all parameters
         self.frame_st_id = 0
         self.init_latent = None
+        self._audit_forward_index = 0
         #### clean vae and transformer cache
         self.transformer.clear_cache(self.cache_name)
         self.streaming_vae.clear_cache()
@@ -470,6 +478,76 @@ class VA_Server:
         os.makedirs(self.exp_save_root, exist_ok=True)
         torch.cuda.empty_cache()
 
+    @staticmethod
+    def _audit_scalar(value):
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor):
+            return float(value.detach().cpu().item())
+        return float(value)
+
+    def _make_inference_trace(
+        self,
+        phase,
+        step,
+        frame_st_id,
+        timestep,
+        raw_sigma,
+        sigma,
+        next_sigma,
+        update_cache,
+        will_update,
+        input_shape,
+    ):
+        if not self.inference_audit:
+            return None
+        trace = {
+            'global_forward': self._audit_forward_index,
+            'chunk': frame_st_id // self.job_config.frame_chunk_size,
+            'phase': phase,
+            'step': step,
+            'timestep': self._audit_scalar(timestep),
+            'raw_sigma': self._audit_scalar(raw_sigma),
+            'sigma': self._audit_scalar(sigma),
+            'next_sigma': self._audit_scalar(next_sigma),
+            'update_cache': update_cache,
+            'will_update': will_update,
+        }
+        self._audit_forward_index += 1
+        next_sigma_text = (
+            'none' if trace['next_sigma'] is None
+            else f"{trace['next_sigma']:.9f}"
+        )
+        delta_sigma_text = (
+            'none' if trace['next_sigma'] is None
+            else f"{trace['next_sigma'] - trace['sigma']:.9f}"
+        )
+        logger.info(
+            "[INFERENCE_AUDIT][SCHEDULER] "
+            f"global_forward={trace['global_forward']} "
+            f"chunk={trace['chunk']} phase={phase} step={step} "
+            f"timestep={trace['timestep']:.6f} "
+            f"raw_sigma={trace['raw_sigma']:.9f} "
+            f"sigma={trace['sigma']:.9f} "
+            f"next_sigma={next_sigma_text} delta_sigma={delta_sigma_text} "
+            f"will_update={will_update} update_cache={update_cache} "
+            f"input_x_shape={tuple(input_shape)}"
+        )
+        return trace
+
+    @staticmethod
+    def _log_inference_output(trace, output, output_type):
+        if trace is None:
+            return
+        logger.info(
+            "[INFERENCE_AUDIT][OUTPUT] "
+            f"global_forward={trace['global_forward']} "
+            f"chunk={trace['chunk']} phase={trace['phase']} "
+            f"step={trace['step']} timestep={trace['timestep']:.6f} "
+            f"output_type={output_type} output_shape={tuple(output.shape)} "
+            f"state_update={trace['will_update']}"
+        )
+
     def _infer(self, obs, frame_st_id=0):
         frame_chunk_size = self.job_config.frame_chunk_size
         if frame_st_id == 0:
@@ -498,12 +576,20 @@ class VA_Server:
         self.scheduler.set_timesteps(video_inference_step)
         self.action_scheduler.set_timesteps(action_inference_step)
         timesteps = self.scheduler.timesteps
+        raw_sigmas = self.scheduler.raw_sigmas
+        sigmas = self.scheduler.sigmas
         action_timesteps = self.action_scheduler.timesteps
+        action_raw_sigmas = self.action_scheduler.raw_sigmas
+        action_sigmas = self.action_scheduler.sigmas
 
         timesteps = F.pad(timesteps, (0, 1), mode='constant', value=0)
+        raw_sigmas = F.pad(raw_sigmas, (0, 1), mode='constant', value=0)
+        sigmas = F.pad(sigmas, (0, 1), mode='constant', value=0)
 
         if video_step != -1:
             timesteps = timesteps[:video_step]
+            raw_sigmas = raw_sigmas[:video_step]
+            sigmas = sigmas[:video_step]
 
         action_timesteps = F.pad(
             action_timesteps,
@@ -511,6 +597,10 @@ class VA_Server:
              1),  # pad 1 element at the end (right side) of the last dimension
             mode='constant',
             value=0)
+        action_raw_sigmas = F.pad(
+            action_raw_sigmas, (0, 1), mode='constant', value=0)
+        action_sigmas = F.pad(
+            action_sigmas, (0, 1), mode='constant', value=0)
 
         with (
                 torch.no_grad(),
@@ -518,6 +608,23 @@ class VA_Server:
             # 1. Video Generation Loop
             for i, t in enumerate(tqdm(timesteps)):
                 last_step = i == len(timesteps) - 1
+                update_cache = 1 if last_step else 0
+                will_update = not last_step or video_step != -1
+                next_sigma = None
+                if will_update:
+                    _, next_sigma = self.scheduler.get_step_sigmas(t)
+                trace = self._make_inference_trace(
+                    phase='video',
+                    step=i,
+                    frame_st_id=frame_st_id,
+                    timestep=t,
+                    raw_sigma=raw_sigmas[i],
+                    sigma=sigmas[i],
+                    next_sigma=next_sigma,
+                    update_cache=update_cache,
+                    will_update=will_update,
+                    input_shape=latents.shape,
+                )
                 latent_cond = init_latent[:, :, 0:1].to(
                     self.dtype) if frame_st_id == 0 else None
                 input_dict = self._prepare_latent_input(
@@ -531,13 +638,16 @@ class VA_Server:
 
                 video_noise_pred = self.transformer(
                     self._repeat_input_for_cfg(input_dict['latent_res_lst']),
-                    update_cache=1 if last_step else 0,
+                    update_cache=update_cache,
                     cache_name=self.cache_name,
                     action_mode=False,
                     attention_step_index=i,
-                    attention_timestep=t)
+                    attention_timestep=t,
+                    inference_trace=trace,
+                    inference_audit_layers=self.inference_audit_layers)
+                self._log_inference_output(trace, video_noise_pred, 'velocity')
 
-                if not last_step or video_step != -1:
+                if will_update:
                     video_noise_pred = data_seq_to_patch(
                         self.job_config.patch_size, video_noise_pred,
                         frame_chunk_size, self.latent_height,
@@ -555,6 +665,23 @@ class VA_Server:
 
             for i, t in enumerate(tqdm(action_timesteps)):
                 last_step = i == len(action_timesteps) - 1
+                update_cache = 1 if last_step else 0
+                will_update = not last_step
+                next_sigma = None
+                if will_update:
+                    _, next_sigma = self.action_scheduler.get_step_sigmas(t)
+                trace = self._make_inference_trace(
+                    phase='action',
+                    step=i,
+                    frame_st_id=frame_st_id,
+                    timestep=t,
+                    raw_sigma=action_raw_sigmas[i],
+                    sigma=action_sigmas[i],
+                    next_sigma=next_sigma,
+                    update_cache=update_cache,
+                    will_update=will_update,
+                    input_shape=actions.shape,
+                )
                 action_cond = torch.zeros(
                     [
                         1, self.job_config.action_dim, 1,
@@ -573,11 +700,14 @@ class VA_Server:
                     frame_st_id=frame_st_id)
                 action_noise_pred = self.transformer(
                     self._repeat_input_for_cfg(input_dict['action_res_lst']),
-                    update_cache=1 if last_step else 0,
+                    update_cache=update_cache,
                     cache_name=self.cache_name,
-                    action_mode=True)
+                    action_mode=True,
+                    inference_trace=trace,
+                    inference_audit_layers=self.inference_audit_layers)
+                self._log_inference_output(trace, action_noise_pred, 'velocity')
 
-                if not last_step:
+                if will_update:
                     action_noise_pred = rearrange(action_noise_pred,
                                                   'b (f n) c -> b c f n 1',
                                                   f=frame_chunk_size)
@@ -623,15 +753,47 @@ class VA_Server:
         with (
                 torch.no_grad(),
         ):
-            self.transformer(self._repeat_input_for_cfg(input_dict['latent_res_lst']),
-                             update_cache=2,
-                             cache_name=self.cache_name,
-                             action_mode=False)
+            video_trace = self._make_inference_trace(
+                phase='cache_video',
+                step=0,
+                frame_st_id=self.frame_st_id,
+                timestep=0,
+                raw_sigma=0,
+                sigma=0,
+                next_sigma=None,
+                update_cache=2,
+                will_update=False,
+                input_shape=input_dict['latent_res_lst']['noisy_latents'].shape,
+            )
+            video_output = self.transformer(
+                self._repeat_input_for_cfg(input_dict['latent_res_lst']),
+                update_cache=2,
+                cache_name=self.cache_name,
+                action_mode=False,
+                inference_trace=video_trace,
+                inference_audit_layers=self.inference_audit_layers)
+            self._log_inference_output(video_trace, video_output, 'cache_only')
 
-            self.transformer(self._repeat_input_for_cfg(input_dict['action_res_lst']),
-                             update_cache=2,
-                             cache_name=self.cache_name,
-                             action_mode=True)
+            action_trace = self._make_inference_trace(
+                phase='cache_action',
+                step=0,
+                frame_st_id=self.frame_st_id,
+                timestep=0,
+                raw_sigma=0,
+                sigma=0,
+                next_sigma=None,
+                update_cache=2,
+                will_update=False,
+                input_shape=input_dict['action_res_lst']['noisy_latents'].shape,
+            )
+            action_output = self.transformer(
+                self._repeat_input_for_cfg(input_dict['action_res_lst']),
+                update_cache=2,
+                cache_name=self.cache_name,
+                action_mode=True,
+                inference_trace=action_trace,
+                inference_audit_layers=self.inference_audit_layers)
+            self._log_inference_output(action_trace, action_output, 'cache_only')
         torch.cuda.empty_cache()
         self.frame_st_id += latent_model_input.shape[2]
 
@@ -734,6 +896,21 @@ def run(args):
         ]
     config.attention_output = args.attention_output
     config.attention_chunk_tokens = args.attention_chunk_tokens
+    config.inference_audit = args.inference_audit
+    if args.inference_audit_layers.strip().lower() == 'all':
+        config.inference_audit_layers = list(range(30))
+    else:
+        config.inference_audit_layers = sorted({
+            int(layer)
+            for layer in args.inference_audit_layers.split(',')
+            if layer.strip()
+        })
+    if config.inference_audit and (
+        not config.inference_audit_layers
+        or any(layer < 0 or layer >= 30
+               for layer in config.inference_audit_layers)
+    ):
+        raise ValueError("inference audit layers must be in [0, 29]")
     if args.attention_timesteps is None:
         config.attention_step_indices = None
     else:
@@ -857,6 +1034,17 @@ def main():
             'comma-separated zero-based video denoising step indices; '
             'default captures the legacy final pass'
         ),
+    )
+    parser.add_argument(
+        "--inference-audit",
+        action='store_true',
+        help='log scheduler, transformer, and self-attention execution facts',
+    )
+    parser.add_argument(
+        "--inference-audit-layers",
+        type=str,
+        default='0,29',
+        help="'all' or comma-separated self-attention layers to trace",
     )
     args = parser.parse_args()
     run(args)

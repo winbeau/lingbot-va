@@ -256,6 +256,20 @@ To capture selected video denoising step indices instead of only the legacy fina
 
 This writes `attn-exp/<prompt-action-slug>/step_000/lXXhXX.csv`, `step_001/lXXhXX.csv`, and `step_002/lXXhXX.csv`. Omitting the option preserves the previous behavior and captures the final `t=0` pass.
 
+To audit the actual sampler, Transformer, and self-attention execution path without exporting attention matrices, enable the inference trace for selected layers:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 NGPU=1 CONFIG_NAME='robotwin_i2av' \
+  uv run bash script/run_launch_va_server_sync.sh \
+  --model-path /path/to/lingbot-va-posttrain-robotwin \
+  --num-chunks-to-infer 1 \
+  --save_root /tmp/lingbot-inference-audit \
+  --inference-audit \
+  --inference-audit-layers 0,29
+```
+
+`[INFERENCE_AUDIT]` log records distinguish the pre-shift sigma, post-shift sigma/model timestep, state update, modality-specific Transformer input, and the VV/VA/AV/AA regions present in the traced self-attention layers.
+
 To summarize one step as per-layer top-p sparsity, run:
 
 ```bash
