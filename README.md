@@ -256,6 +256,17 @@ To capture selected video denoising step indices instead of only the legacy fina
 
 This writes `attn-exp/<prompt-action-slug>/step_000/lXXhXX.csv`, `step_001/lXXhXX.csv`, and `step_002/lXXhXX.csv`. Omitting the option preserves the previous behavior and captures the final `t=0` pass.
 
+To summarize one step as per-layer top-p sparsity, run:
+
+```bash
+uv run python script/compute_attention_density.py \
+  --input-dir attn-exp/<prompt-action-slug>/step_000 \
+  --output-dir density-results \
+  --processes 32
+```
+
+For each query and head, the script renormalizes the available video-key probabilities, finds the minimum number `k` of tokens whose cumulative mass reaches 0.9, and computes `density = 1 - k / N`. Empty future-key fields are excluded from `N`. The final layer value averages this sparsity over all queries and heads. The process count defaults to three quarters of the available CPUs. The output is `density-results/step_000.csv` with columns `layer,density`; run the same command for `step_001` and `step_002` to create three files in one output directory.
+
 
 ## Post-Training LingBot-VA
 
