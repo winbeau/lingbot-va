@@ -90,21 +90,28 @@ class VA_Server:
         )
         self.attention_recorder = None
         if getattr(job_config, 'attention_analysis', False):
-            if job_config.world_size != 1:
-                raise ValueError("Attention analysis currently requires one GPU")
             attention_output = getattr(job_config, 'attention_output', None)
             if attention_output is None:
                 attention_output = 'attn-exp'
+            attention_layers = job_config.attention_layers
+            if job_config.world_size > 1:
+                attention_layers = attention_layers[
+                    job_config.rank::job_config.world_size
+                ]
             self.attention_recorder = JointAttentionRecorder(
                 output_dir=attention_output,
-                layers=job_config.attention_layers,
+                layers=attention_layers,
+                summary_layers=job_config.attention_layers,
+                worker_id=job_config.rank,
+                write_summary=job_config.rank == 0,
                 experiment_name=getattr(job_config, 'prompt', 'prompt-action'),
                 chunk_tokens=job_config.attention_chunk_tokens,
             )
             self.transformer.set_attention_recorder(self.attention_recorder)
             logger.info(
                 f"Enable joint attention analysis for layers "
-                f"{job_config.attention_layers}; output={attention_output}")
+                f"{attention_layers} on rank {job_config.rank}; "
+                f"output={attention_output}")
         shard_fn = shard_model
         self.transformer = _configure_model(model=self.transformer,
                                             shard_fn=shard_fn,
@@ -681,7 +688,10 @@ class VA_Server:
         pred_action = torch.cat(pred_action_lst, dim=1).flatten(1)
         if self.attention_recorder is not None:
             summary_path = self.attention_recorder.save()
-            logger.info(f"Saved joint attention analysis to {summary_path}")
+            if torch.distributed.is_initialized():
+                torch.distributed.barrier()
+            if self.job_config.rank == 0:
+                logger.info(f"Saved joint attention analysis to {summary_path}")
         self.transformer.clear_cache(self.cache_name)
         self.streaming_vae.clear_cache()
         if self.streaming_vae_half:
@@ -691,10 +701,13 @@ class VA_Server:
         del self.text_encoder
         torch.cuda.empty_cache()
         
+        if self.job_config.rank != 0:
+            return
+
         # Move VAE to GPU for decoding
         if self.enable_offload:
             self.vae = self.vae.to(self.device).to(self.dtype)
-        
+
         decoded_video = self.decode_one_video(pred_latent, 'np')[0]
         export_to_video(decoded_video, os.path.join(self.save_root, "demo.mp4"), fps=10)
 
@@ -733,6 +746,9 @@ def run(args):
     config.rank = rank
     config.local_rank = local_rank
     config.world_size = world_size
+    if config.attention_analysis and world_size > 1:
+        torch.manual_seed(0)
+        torch.cuda.manual_seed_all(0)
     model = VA_Server(config)
     if config.infer_mode == 'i2va':
         logger.info(f"******************************USE I2AV mode******************************")

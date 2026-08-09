@@ -82,14 +82,22 @@ class JointAttentionRecorder:
         experiment_name,
         batch_index=0,
         chunk_tokens=512,
+        worker_id=0,
+        summary_layers=None,
+        write_summary=True,
     ):
         self.output_root = Path(output_dir)
         self.output_dir = self.output_root / _slugify(experiment_name)
         self.layers = set(layers)
+        self.summary_layers = sorted(
+            set(self.layers if summary_layers is None else summary_layers)
+        )
         self.batch_index = batch_index
         self.chunk_tokens = chunk_tokens
-        self.blocks_dir = self.output_dir / ".attention-blocks"
+        self.blocks_root = self.output_dir / ".attention-blocks"
+        self.blocks_dir = self.blocks_root / f"worker_{worker_id:02d}"
         self.blocks_dir.mkdir(parents=True, exist_ok=True)
+        self.write_summary = write_summary
         self.block_files = {layer: [] for layer in self.layers}
         self.chunk_metadata = []
 
@@ -192,43 +200,49 @@ class JointAttentionRecorder:
             )
 
         summary_path = self.output_dir / "summary.json"
-        summary_path.write_text(
-            json.dumps(
-                {
-                    "semantics": (
-                        "rows concatenate each chunk's current-video Q; columns are "
-                        "chronological video-history K; softmax denominators include "
-                        "all KV modalities visible at that chunk"
-                    ),
-                    "logical_shape_per_csv": logical_shape,
-                    "csv_pattern": "lXXhXX.csv",
-                    "csv_header": False,
-                    "future_columns": "empty CSV fields",
-                    "layer_indices": layer_indices,
-                    "num_heads": num_heads,
-                    "num_chunks": chunk_count,
-                    "chunk_tokens": self.chunk_tokens,
-                    "row_token_ids": row_token_ids,
-                    "history_token_ids": history_token_ids,
-                    "row_chunk_boundaries": _cumulative_boundaries(
-                        metadata["query_tokens"] for metadata in self.chunk_metadata
-                    ),
-                    "history_chunk_boundaries": _history_boundaries(
-                        self.chunk_metadata, history_token_ids
-                    ),
-                    "chunks": [
-                        {
-                            key: value
-                            for key, value in metadata.items()
-                            if key not in {"query_token_ids", "key_token_ids"}
-                        }
-                        for metadata in self.chunk_metadata
-                    ],
-                },
-                indent=2,
+        if self.write_summary:
+            summary_path.write_text(
+                json.dumps(
+                    {
+                        "semantics": (
+                            "rows concatenate each chunk's current-video Q; columns "
+                            "are chronological video-history K; softmax denominators "
+                            "include all KV modalities visible at that chunk"
+                        ),
+                        "logical_shape_per_csv": logical_shape,
+                        "csv_pattern": "lXXhXX.csv",
+                        "csv_header": False,
+                        "future_columns": "empty CSV fields",
+                        "layer_indices": self.summary_layers,
+                        "num_heads": num_heads,
+                        "num_chunks": chunk_count,
+                        "chunk_tokens": self.chunk_tokens,
+                        "row_token_ids": row_token_ids,
+                        "history_token_ids": history_token_ids,
+                        "row_chunk_boundaries": _cumulative_boundaries(
+                            metadata["query_tokens"]
+                            for metadata in self.chunk_metadata
+                        ),
+                        "history_chunk_boundaries": _history_boundaries(
+                            self.chunk_metadata, history_token_ids
+                        ),
+                        "chunks": [
+                            {
+                                key: value
+                                for key, value in metadata.items()
+                                if key not in {"query_token_ids", "key_token_ids"}
+                            }
+                            for metadata in self.chunk_metadata
+                        ],
+                    },
+                    indent=2,
+                )
             )
-        )
         shutil.rmtree(self.blocks_dir)
+        try:
+            self.blocks_root.rmdir()
+        except OSError:
+            pass
         return summary_path
 
     def _num_heads(self, layer_index):
