@@ -36,6 +36,7 @@ from utils import (
     run_async_server_mode,
     save_async,
 )
+from utils.attention_analysis import JointAttentionRecorder
 
 
 class VA_Server:
@@ -84,6 +85,23 @@ class VA_Server:
             torch_device=self.device,
             attn_mode="torch"
         )
+        self.attention_recorder = None
+        if getattr(job_config, 'attention_analysis', False):
+            if job_config.world_size != 1:
+                raise ValueError("Attention analysis currently requires one GPU")
+            attention_output = getattr(job_config, 'attention_output', None)
+            if attention_output is None:
+                attention_output = os.path.join(self.save_root,
+                                                'attention_analysis')
+            self.attention_recorder = JointAttentionRecorder(
+                output_dir=attention_output,
+                layers=job_config.attention_layers,
+                chunk_tokens=job_config.attention_chunk_tokens,
+            )
+            self.transformer.set_attention_recorder(self.attention_recorder)
+            logger.info(
+                f"Enable joint attention analysis for layers "
+                f"{job_config.attention_layers}; output={attention_output}")
         shard_fn = shard_model
         self.transformer = _configure_model(model=self.transformer,
                                             shard_fn=shard_fn,
@@ -658,6 +676,9 @@ class VA_Server:
             pred_action_lst.append(actions)
         pred_latent = torch.cat(pred_latent_lst, dim=2)
         pred_action = torch.cat(pred_action_lst, dim=1).flatten(1)
+        if self.attention_recorder is not None:
+            summary_path = self.attention_recorder.save()
+            logger.info(f"Saved joint attention analysis to {summary_path}")
         self.transformer.clear_cache(self.cache_name)
         self.streaming_vae.clear_cache()
         if self.streaming_vae_half:
@@ -680,6 +701,23 @@ def run(args):
     port = config.port if args.port is None else args.port
     if args.save_root is not None:
         config.save_root = args.save_root
+    if args.model_path is not None:
+        config.wan22_pretrained_model_name_or_path = args.model_path
+    if args.num_chunks_to_infer is not None:
+        config.num_chunks_to_infer = args.num_chunks_to_infer
+    config.attention_analysis = args.attention_analysis
+    config.attention_layers = [
+        int(layer) for layer in args.attention_layers.split(',') if layer.strip()
+    ]
+    config.attention_output = args.attention_output
+    config.attention_chunk_tokens = args.attention_chunk_tokens
+    if config.attention_analysis:
+        if config.infer_mode != 'i2va':
+            raise ValueError("Attention analysis currently supports i2va mode only")
+        if not config.attention_layers:
+            raise ValueError("At least one attention layer is required")
+        if config.attention_chunk_tokens <= 0:
+            raise ValueError("attention_chunk_tokens must be positive")
     rank = int(os.getenv("RANK", 0))
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -720,6 +758,41 @@ def main():
         type=str,
         default=None,
         help='save root'
+    )
+    parser.add_argument(
+        "--model-path",
+        type=str,
+        default=None,
+        help='downloaded LingBot-VA model directory',
+    )
+    parser.add_argument(
+        "--num-chunks-to-infer",
+        type=int,
+        default=None,
+        help='override the number of generated video-action chunks',
+    )
+    parser.add_argument(
+        "--attention-analysis",
+        action='store_true',
+        help='capture low-memory video-action joint attention summaries',
+    )
+    parser.add_argument(
+        "--attention-layers",
+        type=str,
+        default='0,14,29',
+        help='comma-separated self-attention layer indices',
+    )
+    parser.add_argument(
+        "--attention-output",
+        type=str,
+        default=None,
+        help='attention JSON and heatmap output directory',
+    )
+    parser.add_argument(
+        "--attention-chunk-tokens",
+        type=int,
+        default=512,
+        help='key-token chunk size for streaming attention extraction',
     )
     args = parser.parse_args()
     run(args)

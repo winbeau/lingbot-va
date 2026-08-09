@@ -329,6 +329,8 @@ class WanAttention(torch.nn.Module):
                                        eps=eps,
                                        elementwise_affine=True)
         self.attn_caches = {} if cross_attention_dim_head is None else None
+        self.attention_recorder = None
+        self.analysis_layer_index = -1
 
     def clear_pred_cache(self, cache_name):
         if self.attn_caches is None:
@@ -361,6 +363,10 @@ class WanAttention(torch.nn.Module):
             torch.zeros((total_tolen, ), dtype=torch.bool, device=device),
             "is_pred":
             torch.zeros((total_tolen, ), dtype=torch.bool, device=device),
+            "token_type":
+            torch.full((total_tolen, ), -1, dtype=torch.int8, device=device),
+            "frame_id":
+            torch.full((total_tolen, ), -1, dtype=torch.long, device=device),
         }
 
     def allocate_slots(self, cache_name, key_size):
@@ -393,7 +399,8 @@ class WanAttention(torch.nn.Module):
         else:
             return torch.tensor(0, device=ids.device, dtype=ids.dtype)
 
-    def update_cache(self, cache_name, key, value, is_pred):
+    def update_cache(self, cache_name, key, value, is_pred, token_type,
+                     frame_ids):
         cache = self.attn_caches[cache_name]
 
         key_size = key.shape[1]
@@ -406,6 +413,8 @@ class WanAttention(torch.nn.Module):
         cache['mask'][slots] = True
         cache['id'][slots] = new_id
         cache['is_pred'][slots] = is_pred
+        cache['token_type'][slots] = token_type
+        cache['frame_id'][slots] = frame_ids.to(cache['frame_id'].device)
         return slots
 
     def restore_cache(self, cache_name, slots):
@@ -419,6 +428,8 @@ class WanAttention(torch.nn.Module):
         rotary_emb,
         update_cache=0,
         cache_name='pos',
+        token_type=None,
+        token_frame_ids=None,
     ):
         kv_cache = self.attn_caches[
             cache_name] if (self.attn_caches is not None) and (cache_name in self.attn_caches) else None
@@ -439,18 +450,58 @@ class WanAttention(torch.nn.Module):
                 return x_out.to(x.dtype)
             query = apply_rotary_emb(query, rotary_emb)
             key = apply_rotary_emb(key, rotary_emb)
+
+        token_type = -1 if token_type is None else int(token_type)
+        query_token_types = torch.full((query.shape[1], ), token_type,
+                                       dtype=torch.int8, device=query.device)
+        if token_frame_ids is None:
+            query_frame_ids = torch.full((query.shape[1], ), -1,
+                                         dtype=torch.long, device=query.device)
+        else:
+            query_frame_ids = token_frame_ids[0] if token_frame_ids.ndim == 2 else token_frame_ids
+            query_frame_ids = query_frame_ids.to(query.device, dtype=torch.long)
+            if query_frame_ids.numel() != query.shape[1]:
+                raise ValueError(
+                    f"Token/frame length mismatch: {query.shape[1]} vs "
+                    f"{query_frame_ids.numel()}")
+
+        key_token_types = torch.full((key.shape[1], ), -1, dtype=torch.int8,
+                                     device=query.device)
+        key_frame_ids = torch.full((key.shape[1], ), -1, dtype=torch.long,
+                                   device=query.device)
+        if key.shape[1] == query.shape[1]:
+            key_token_types = query_token_types
+            key_frame_ids = query_frame_ids
+
         slots = None
         if kv_cache is not None and kv_cache['k'] is not None:
             slots = self.update_cache(cache_name,
                                       key,
                                       value,
-                                      is_pred=(update_cache == 1))
+                                      is_pred=(update_cache == 1),
+                                      token_type=token_type,
+                                      frame_ids=query_frame_ids)
             key_pool = self.attn_caches[cache_name]['k']
             value_pool = self.attn_caches[cache_name]['v']
             mask = self.attn_caches[cache_name]['mask']
             valid = mask.nonzero(as_tuple=False).squeeze(-1)
             key = key_pool[:, valid]
             value = value_pool[:, valid]
+            key_token_types = self.attn_caches[cache_name]['token_type'][valid]
+            key_frame_ids = self.attn_caches[cache_name]['frame_id'][valid]
+
+        if self.attention_recorder is not None:
+            self.attention_recorder.capture(
+                layer_index=self.analysis_layer_index,
+                query=query,
+                key=key,
+                query_token_types=query_token_types,
+                key_token_types=key_token_types,
+                query_frame_ids=query_frame_ids,
+                key_frame_ids=key_frame_ids,
+                update_cache=update_cache,
+                cache_name=cache_name,
+            )
 
         hidden_states = self.attn_op(query, key, value)
 
@@ -520,6 +571,8 @@ class WanTransformerBlock(nn.Module):
         rotary_emb,
         update_cache=0,
         cache_name='pos',
+        token_type=None,
+        token_frame_ids=None,
     ) -> torch.Tensor:
         temb_scale_shift_table = self.scale_shift_table[None] + temb.float()
         shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = \
@@ -539,7 +592,9 @@ class WanTransformerBlock(nn.Module):
                                  norm_hidden_states,
                                  rotary_emb,
                                  update_cache=update_cache,
-                                 cache_name=cache_name)
+                                 cache_name=cache_name,
+                                 token_type=token_type,
+                                 token_frame_ids=token_frame_ids)
         hidden_states = (hidden_states.float() +
                          attn_output * gate_msa).type_as(hidden_states)
 
@@ -667,6 +722,11 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             block.attn1.init_kv_cache(cache_name, total_tolen,
                                       self.num_attention_heads,
                                       self.attention_head_dim, device, dtype, batch_size)
+
+    def set_attention_recorder(self, recorder):
+        for layer_index, block in enumerate(self.blocks):
+            block.attn1.attention_recorder = recorder
+            block.attn1.analysis_layer_index = layer_index
     
     def _input_embed(self, latents, input_type='latent'):
         if input_type == 'latent':
@@ -857,13 +917,17 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
             latent_time_steps, dtype=latent_hidden_states.dtype)
         timestep_proj = timestep_proj.unflatten(2, (6, -1))  # B L 6 C
 
+        token_type = 1 if action_mode else 0
+        token_frame_ids = torch.floor(latent_grid_id[:, 0, :]).to(torch.long)
         for block in self.blocks:
             latent_hidden_states = block(latent_hidden_states,
                                          text_hidden_states,
                                          timestep_proj,
                                          rotary_emb,
                                          update_cache=update_cache,
-                                         cache_name=cache_name)
+                                         cache_name=cache_name,
+                                         token_type=token_type,
+                                         token_frame_ids=token_frame_ids)
         temb_scale_shift_table = self.scale_shift_table[None] + temb[:, :, None, ...]
         shift, scale = rearrange(temb_scale_shift_table,
                                  'b l n c -> b n l c').chunk(2, dim=1)

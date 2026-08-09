@@ -232,6 +232,21 @@ NGPU=1 CONFIG_NAME='robotwin_i2av' bash script/run_launch_va_server_sync.sh
 
 > **GPU Memory Requirements**: Approximately **18GB VRAM** for single-GPU i2av inference with offload mode enabled (VAE and text_encoder offloaded to CPU).
 
+#### Video-Action Joint Attention Analysis
+
+The analysis probe uses Pyramid-Forcing's two-pass chunked softmax method. It keeps only a `Q × K_chunk` score block and immediately aggregates probability mass by modality and frame, rather than saving full token-level attention matrices. Generate at least two chunks to observe both `action → video` and subsequent `video → action` attention:
+
+```bash
+NGPU=1 CONFIG_NAME='robotwin_i2av' uv run bash script/run_launch_va_server_sync.sh \
+  --model-path /root/wenbiao_zhao/models/lingbot-va-posttrain-robotwin \
+  --num-chunks-to-infer 2 \
+  --attention-analysis \
+  --attention-layers 0,14,29 \
+  --save_root train_out/robotwin-attention
+```
+
+The probe writes `summary.json`, modality heatmaps, and per-layer frame heatmaps to `train_out/robotwin-attention/attention_analysis/`.
+
 
 ## Post-Training LingBot-VA
 
