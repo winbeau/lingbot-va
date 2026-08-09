@@ -2,7 +2,10 @@
 import gc
 
 import torch
-from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
+try:
+    from torch.distributed._composable.fsdp import fully_shard, MixedPrecisionPolicy
+except ImportError:
+    from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
 
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
     checkpoint_wrapper as ptd_checkpoint_wrapper,
