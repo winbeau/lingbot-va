@@ -36,3 +36,40 @@ Stop instead of resetting or overwriting files when the local or remote checkout
 - Reproducible H100 install: `uv sync --frozen`.
 - Minimal dependency smoke test on H100:
   `uv run python -c "import torch, flash_attn; print(torch.__version__, torch.version.cuda, flash_attn.__version__)"`
+
+## Attention extraction and density workflow
+
+- Treat the current `robotwin_i2av` execution path and `lingbot-va-posttrain-robotwin` checkpoint as LingBot-VA 1.0-style velocity FlowMatch inference, not the LingBot-VA 2.0 distilled student. The VA2 student checkpoint and deployment sampler are not wired into this repository path.
+- RoboTwin video inference performs 25 denoising updates at zero-based step indices `0..24`, then appends step index `25` at scheduler timestep `0` as a cache-only Transformer forward. Step `25` still executes VV attention but does not call `scheduler.step()` or update the video latent.
+- Use `summary.json`, not the step index alone, as the source of truth for the actual shifted scheduler timestep.
+- To extract six video-forward positions at an index interval of five (`0,5,10,15,20,25`) across all 30 layers and 24 heads on eight GPUs, run on `h100-server`:
+
+  ```bash
+  cd /root/wenbiao_zhao/lingbot-va && \
+  CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+  NGPU=8 CONFIG_NAME='robotwin_i2av' \
+  uv run bash script/run_launch_va_server_sync.sh \
+    --model-path /root/wenbiao_zhao/models/lingbot-va-posttrain-robotwin \
+    --num-chunks-to-infer 10 \
+    --save_root train_out-vv-10-6 \
+    --attention-analysis \
+    --attention-layers all \
+    --attention-timesteps 0,5,10,15,20,25 \
+    --attention-output attn-exp-vv-10-6
+  ```
+
+- To compute top-p=0.9 per-layer density for those six output directories, run:
+
+  ```bash
+  cd /root/wenbiao_zhao/lingbot-va && \
+  INPUT_ROOT='attn-exp-vv-10-6/grab-the-medium-sized-white-mug-rotate-it-place-it-on-the-table-and-hook-it-onto-the-smooth-dark-gray-rack' && \
+  OUTPUT_DIR='attn-density-vv-10-6' && \
+  for step in 000 005 010 015 020 025; do
+    uv run python script/compute_attention_density.py \
+      --input-dir "$INPUT_ROOT/step_$step" \
+      --output-dir "$OUTPUT_DIR"
+  done && \
+  ls -lh "$OUTPUT_DIR"
+  ```
+
+- The density script defaults to three quarters of available CPUs, capped by the 30 layer tasks. Each output is named after its input directory, for example `attn-density-vv-10-6/step_005.csv`.

@@ -248,13 +248,27 @@ CUDA_VISIBLE_DEVICES=1 NGPU=1 CONFIG_NAME='robotwin_i2av' \
 
 Outputs follow `attn-exp/<prompt-action-slug>/lXXhXX.csv`. CSV rows are chronological current-video Q tokens, columns are chronological video-history K tokens, and future keys that were unavailable to an earlier chunk are empty fields. `summary.json` records the logical matrix shape, chunk boundaries, and token coordinates. With all 30 layers and 24 heads, the run creates 720 CSV files.
 
-To capture selected video denoising step indices instead of only the legacy final pass, use `--attention-timesteps`. The indices are zero-based positions in the padded video denoising loop, and the actual scheduler value is recorded in `summary.json`:
+To capture selected video denoising step indices instead of only the legacy final pass, use `--attention-timesteps`. The indices are zero-based positions in the padded video denoising loop, and the actual scheduler value is recorded in `summary.json`.
+
+The current open-source `robotwin_i2av` path with `lingbot-va-posttrain-robotwin` runs LingBot-VA 1.0-style velocity FlowMatch inference, not the LingBot-VA 2.0 distilled student. RoboTwin performs 25 video denoising updates at indices `0..24`, followed by an appended index `25` at scheduler timestep `0`. Index `25` is a cache-only Transformer forward: it still computes VV attention but does not update the video latent.
+
+The following eight-GPU command records six video-forward positions at an index interval of five. The first five positions sample the 25-step denoising trajectory, while `step_025` records the final `t=0` cache pass:
 
 ```bash
---attention-timesteps 0,1,2
+cd /root/wenbiao_zhao/lingbot-va && \
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
+NGPU=8 CONFIG_NAME='robotwin_i2av' \
+uv run bash script/run_launch_va_server_sync.sh \
+  --model-path /root/wenbiao_zhao/models/lingbot-va-posttrain-robotwin \
+  --num-chunks-to-infer 10 \
+  --save_root train_out-vv-10-6 \
+  --attention-analysis \
+  --attention-layers all \
+  --attention-timesteps 0,5,10,15,20,25 \
+  --attention-output attn-exp-vv-10-6
 ```
 
-This writes `attn-exp/<prompt-action-slug>/step_000/lXXhXX.csv`, `step_001/lXXhXX.csv`, and `step_002/lXXhXX.csv`. Omitting the option preserves the previous behavior and captures the final `t=0` pass.
+This writes `step_000`, `step_005`, `step_010`, `step_015`, `step_020`, and `step_025` below `attn-exp-vv-10-6/<prompt-action-slug>/`. Omitting `--attention-timesteps` preserves the legacy behavior and captures only the final `t=0` pass.
 
 To audit the actual sampler, Transformer, and self-attention execution path without exporting attention matrices, enable the inference trace for selected layers:
 
@@ -270,16 +284,21 @@ CUDA_VISIBLE_DEVICES=0 NGPU=1 CONFIG_NAME='robotwin_i2av' \
 
 `[INFERENCE_AUDIT]` log records distinguish the pre-shift sigma, post-shift sigma/model timestep, state update, modality-specific Transformer input, and the VV/VA/AV/AA regions present in the traced self-attention layers.
 
-To summarize one step as per-layer top-p sparsity, run:
+To compute per-layer top-p density for all six positions from the RoboTwin export above, run:
 
 ```bash
-uv run python script/compute_attention_density.py \
-  --input-dir attn-exp/<prompt-action-slug>/step_000 \
-  --output-dir density-results \
-  --processes 32
+cd /root/wenbiao_zhao/lingbot-va && \
+INPUT_ROOT='attn-exp-vv-10-6/grab-the-medium-sized-white-mug-rotate-it-place-it-on-the-table-and-hook-it-onto-the-smooth-dark-gray-rack' && \
+OUTPUT_DIR='attn-density-vv-10-6' && \
+for step in 000 005 010 015 020 025; do
+  uv run python script/compute_attention_density.py \
+    --input-dir "$INPUT_ROOT/step_$step" \
+    --output-dir "$OUTPUT_DIR"
+done && \
+ls -lh "$OUTPUT_DIR"
 ```
 
-For each query and head, the script renormalizes the available video-key probabilities, finds the minimum number `k` of tokens whose cumulative mass reaches 0.9, and computes `density = 1 - k / N`. Empty future-key fields are excluded from `N`. The final layer value averages this sparsity over all queries and heads. The process count defaults to three quarters of the available CPUs. The output is `density-results/step_000.csv` with columns `layer,density`; run the same command for `step_001` and `step_002` to create three files in one output directory.
+For each query and head, the script renormalizes the available video-key probabilities, finds the minimum number `k` of tokens whose cumulative mass reaches 0.9, and computes `density = 1 - k / N`. Empty future-key fields are excluded from `N`. The final layer value averages this sparsity over all queries and heads. The process count defaults to three quarters of the available CPUs and is capped by the 30 layer tasks. The command creates `step_000.csv`, `step_005.csv`, `step_010.csv`, `step_015.csv`, `step_020.csv`, and `step_025.csv` in `attn-density-vv-10-6/`, each with columns `layer,density`.
 
 
 ## Post-Training LingBot-VA
