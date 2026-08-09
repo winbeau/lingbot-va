@@ -430,6 +430,8 @@ class WanAttention(torch.nn.Module):
         cache_name='pos',
         token_type=None,
         token_frame_ids=None,
+        attention_step_index=None,
+        attention_timestep=None,
     ):
         kv_cache = self.attn_caches[
             cache_name] if (self.attn_caches is not None) and (cache_name in self.attn_caches) else None
@@ -501,6 +503,8 @@ class WanAttention(torch.nn.Module):
                 key_frame_ids=key_frame_ids,
                 update_cache=update_cache,
                 cache_name=cache_name,
+                attention_step_index=attention_step_index,
+                attention_timestep=attention_timestep,
             )
 
         hidden_states = self.attn_op(query, key, value)
@@ -573,6 +577,8 @@ class WanTransformerBlock(nn.Module):
         cache_name='pos',
         token_type=None,
         token_frame_ids=None,
+        attention_step_index=None,
+        attention_timestep=None,
     ) -> torch.Tensor:
         temb_scale_shift_table = self.scale_shift_table[None] + temb.float()
         shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = \
@@ -594,7 +600,9 @@ class WanTransformerBlock(nn.Module):
                                  update_cache=update_cache,
                                  cache_name=cache_name,
                                  token_type=token_type,
-                                 token_frame_ids=token_frame_ids)
+                                 token_frame_ids=token_frame_ids,
+                                 attention_step_index=attention_step_index,
+                                 attention_timestep=attention_timestep)
         hidden_states = (hidden_states.float() +
                          attn_output * gate_msa).type_as(hidden_states)
 
@@ -864,6 +872,8 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
         cache_name="pos",
         action_mode=False,
         train_mode=False,
+        attention_step_index=None,
+        attention_timestep=None,
     ):
         r"""
         Forward pass through the diffusion model
@@ -927,7 +937,9 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin):
                                          update_cache=update_cache,
                                          cache_name=cache_name,
                                          token_type=token_type,
-                                         token_frame_ids=token_frame_ids)
+                                         token_frame_ids=token_frame_ids,
+                                         attention_step_index=attention_step_index,
+                                         attention_timestep=attention_timestep)
         temb_scale_shift_table = self.scale_shift_table[None] + temb[:, :, None, ...]
         shift, scale = rearrange(temb_scale_shift_table,
                                  'b l n c -> b n l c').chunk(2, dim=1)

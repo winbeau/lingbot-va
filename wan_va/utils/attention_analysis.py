@@ -85,6 +85,7 @@ class JointAttentionRecorder:
         worker_id=0,
         summary_layers=None,
         write_summary=True,
+        step_indices=None,
     ):
         self.output_root = Path(output_dir)
         self.output_dir = self.output_root / _slugify(experiment_name)
@@ -98,8 +99,20 @@ class JointAttentionRecorder:
         self.blocks_dir = self.blocks_root / f"worker_{worker_id:02d}"
         self.blocks_dir.mkdir(parents=True, exist_ok=True)
         self.write_summary = write_summary
-        self.block_files = {layer: [] for layer in self.layers}
-        self.chunk_metadata = []
+        self.step_indices = (
+            None if step_indices is None else sorted(set(int(step) for step in step_indices))
+        )
+        if self.step_indices is not None and any(step < 0 for step in self.step_indices):
+            raise ValueError("Attention step indices must be non-negative")
+        if self.step_indices is None:
+            self.block_files = {layer: [] for layer in self.layers}
+            self.chunk_metadata = []
+        else:
+            self.block_files = {
+                step: {layer: [] for layer in self.layers}
+                for step in self.step_indices
+            }
+            self.chunk_metadata = {step: [] for step in self.step_indices}
 
     @torch.no_grad()
     def capture(
@@ -113,9 +126,26 @@ class JointAttentionRecorder:
         key_frame_ids,
         update_cache,
         cache_name,
+        attention_step_index=None,
+        attention_timestep=None,
     ):
-        if update_cache != 1 or layer_index not in self.layers:
+        if layer_index not in self.layers:
             return
+        step_index = (
+            None if attention_step_index is None else int(attention_step_index)
+        )
+        if self.step_indices is None:
+            if update_cache != 1:
+                return
+            capture_step = None
+            block_files = self.block_files
+            chunk_metadata = self.chunk_metadata
+        else:
+            if step_index not in self.step_indices:
+                return
+            capture_step = step_index
+            block_files = self.block_files[capture_step]
+            chunk_metadata = self.chunk_metadata[capture_step]
 
         query_token_types = query_token_types.to(query.device)
         key_token_types = key_token_types.to(query.device)
@@ -137,17 +167,30 @@ class JointAttentionRecorder:
             chunk_tokens=self.chunk_tokens,
         ).cpu()
 
-        chunk_index = len(self.block_files[layer_index])
-        layer_dir = self.blocks_dir / f"layer_{layer_index:02d}"
+        chunk_index = len(block_files[layer_index])
+        step_dir = (
+            self.blocks_dir
+            if capture_step is None
+            else self.blocks_dir / f"step_{capture_step:03d}"
+        )
+        layer_dir = step_dir / f"layer_{layer_index:02d}"
         layer_dir.mkdir(parents=True, exist_ok=True)
         block_path = layer_dir / f"chunk_{chunk_index:03d}.pt"
         torch.save({"attention": probabilities}, block_path)
-        self.block_files[layer_index].append(block_path)
+        block_files[layer_index].append(block_path)
 
         query_ids = _video_token_ids(query_frame_ids[current_video_query])
         key_ids = _video_token_ids(key_frame_ids[visible_video_history])
+        timestep_value = None
+        if attention_timestep is not None:
+            if isinstance(attention_timestep, torch.Tensor):
+                timestep_value = float(attention_timestep.detach().cpu().item())
+            else:
+                timestep_value = float(attention_timestep)
         metadata = {
             "chunk_index": chunk_index,
+            "step_index": step_index,
+            "scheduler_timestep": timestep_value,
             "query_token_ids": query_ids,
             "key_token_ids": key_ids,
             "query_tokens": len(query_ids),
@@ -157,10 +200,10 @@ class JointAttentionRecorder:
             "query_frame_end": max(token[0] for token in query_ids) + 1,
             "cache_name": cache_name,
         }
-        if chunk_index == len(self.chunk_metadata):
-            self.chunk_metadata.append(metadata)
+        if chunk_index == len(chunk_metadata):
+            chunk_metadata.append(metadata)
         else:
-            expected = self.chunk_metadata[chunk_index]
+            expected = chunk_metadata[chunk_index]
             for field in (
                 "query_token_ids",
                 "key_token_ids",
@@ -172,72 +215,72 @@ class JointAttentionRecorder:
                     )
 
     def save(self):
-        layer_indices = sorted(
-            layer for layer, paths in self.block_files.items() if paths
-        )
-        if not layer_indices:
-            raise RuntimeError("No current-video attention blocks were captured")
-        chunk_count = len(self.chunk_metadata)
-        if any(len(self.block_files[layer]) != chunk_count for layer in layer_indices):
-            raise RuntimeError("Attention layers captured different numbers of chunks")
+        if self.step_indices is None:
+            groups = [
+                (None, self.block_files, self.chunk_metadata, self.output_dir)
+            ]
+        else:
+            missing_steps = [
+                step
+                for step in self.step_indices
+                if not any(self.block_files[step].values())
+            ]
+            if missing_steps:
+                raise RuntimeError(
+                    "No current-video attention blocks were captured for step "
+                    f"indices {missing_steps}"
+                )
+            groups = [
+                (
+                    step,
+                    self.block_files[step],
+                    self.chunk_metadata[step],
+                    self.output_dir / f"step_{step:03d}",
+                )
+                for step in self.step_indices
+            ]
 
-        row_token_ids = [
-            token
-            for metadata in self.chunk_metadata
-            for token in metadata["query_token_ids"]
-        ]
-        history_token_ids = _ordered_union(
-            metadata["key_token_ids"] for metadata in self.chunk_metadata
-        )
-        logical_shape = [len(row_token_ids), len(history_token_ids)]
-        num_heads = self._num_heads(layer_indices[0])
-
-        for layer_index in layer_indices:
-            self._save_layer_csvs(
-                layer_index=layer_index,
-                num_heads=num_heads,
-                history_token_ids=history_token_ids,
+        step_summaries = [
+            self._save_group(
+                requested_step=step,
+                block_files=block_files,
+                chunk_metadata=chunk_metadata,
+                output_dir=output_dir,
             )
+            for step, block_files, chunk_metadata, output_dir in groups
+        ]
+        common_summary = {
+            "semantics": (
+                "rows concatenate each chunk's current-video Q; columns are "
+                "chronological video-history K; softmax denominators include "
+                "all KV modalities visible at that chunk"
+            ),
+            "step_index_semantics": (
+                "zero-based index in the padded video denoising loop; "
+                "scheduler_timestep stores the actual scheduler value"
+            ),
+            "csv_header": False,
+            "future_columns": "empty CSV fields",
+            "layer_indices": self.summary_layers,
+            "chunk_tokens": self.chunk_tokens,
+        }
+        if self.step_indices is None:
+            summary = {
+                **common_summary,
+                "csv_pattern": "lXXhXX.csv",
+                **step_summaries[0],
+            }
+        else:
+            summary = {
+                **common_summary,
+                "csv_pattern": "step_XXX/lXXhXX.csv",
+                "requested_step_indices": self.step_indices,
+                "steps": step_summaries,
+            }
 
         summary_path = self.output_dir / "summary.json"
         if self.write_summary:
-            summary_path.write_text(
-                json.dumps(
-                    {
-                        "semantics": (
-                            "rows concatenate each chunk's current-video Q; columns "
-                            "are chronological video-history K; softmax denominators "
-                            "include all KV modalities visible at that chunk"
-                        ),
-                        "logical_shape_per_csv": logical_shape,
-                        "csv_pattern": "lXXhXX.csv",
-                        "csv_header": False,
-                        "future_columns": "empty CSV fields",
-                        "layer_indices": self.summary_layers,
-                        "num_heads": num_heads,
-                        "num_chunks": chunk_count,
-                        "chunk_tokens": self.chunk_tokens,
-                        "row_token_ids": row_token_ids,
-                        "history_token_ids": history_token_ids,
-                        "row_chunk_boundaries": _cumulative_boundaries(
-                            metadata["query_tokens"]
-                            for metadata in self.chunk_metadata
-                        ),
-                        "history_chunk_boundaries": _history_boundaries(
-                            self.chunk_metadata, history_token_ids
-                        ),
-                        "chunks": [
-                            {
-                                key: value
-                                for key, value in metadata.items()
-                                if key not in {"query_token_ids", "key_token_ids"}
-                            }
-                            for metadata in self.chunk_metadata
-                        ],
-                    },
-                    indent=2,
-                )
-            )
+            summary_path.write_text(json.dumps(summary, indent=2))
         shutil.rmtree(self.blocks_dir)
         try:
             self.blocks_root.rmdir()
@@ -245,24 +288,103 @@ class JointAttentionRecorder:
             pass
         return summary_path
 
-    def _num_heads(self, layer_index):
+    def _save_group(
+        self,
+        requested_step,
+        block_files,
+        chunk_metadata,
+        output_dir,
+    ):
+        layer_indices = sorted(
+            layer for layer, paths in block_files.items() if paths
+        )
+        if not layer_indices:
+            raise RuntimeError("No current-video attention blocks were captured")
+        chunk_count = len(chunk_metadata)
+        if any(len(block_files[layer]) != chunk_count for layer in layer_indices):
+            raise RuntimeError("Attention layers captured different numbers of chunks")
+
+        step_indices = {metadata["step_index"] for metadata in chunk_metadata}
+        scheduler_timesteps = {
+            metadata["scheduler_timestep"] for metadata in chunk_metadata
+        }
+        if len(step_indices) != 1 or len(scheduler_timesteps) != 1:
+            raise RuntimeError("Attention chunks have inconsistent timestep metadata")
+
+        row_token_ids = [
+            token
+            for metadata in chunk_metadata
+            for token in metadata["query_token_ids"]
+        ]
+        history_token_ids = _ordered_union(
+            metadata["key_token_ids"] for metadata in chunk_metadata
+        )
+        logical_shape = [len(row_token_ids), len(history_token_ids)]
+        num_heads = self._num_heads(block_files, layer_indices[0])
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        for layer_index in layer_indices:
+            self._save_layer_csvs(
+                output_dir=output_dir,
+                block_files=block_files,
+                chunk_metadata=chunk_metadata,
+                layer_index=layer_index,
+                num_heads=num_heads,
+                history_token_ids=history_token_ids,
+            )
+
+        return {
+            "requested_step_index": requested_step,
+            "step_index": next(iter(step_indices)),
+            "scheduler_timestep": next(iter(scheduler_timesteps)),
+            "csv_directory": str(output_dir.relative_to(self.output_dir) or "."),
+            "logical_shape_per_csv": logical_shape,
+            "num_heads": num_heads,
+            "num_chunks": chunk_count,
+            "row_token_ids": row_token_ids,
+            "history_token_ids": history_token_ids,
+            "row_chunk_boundaries": _cumulative_boundaries(
+                metadata["query_tokens"] for metadata in chunk_metadata
+            ),
+            "history_chunk_boundaries": _history_boundaries(
+                chunk_metadata, history_token_ids
+            ),
+            "chunks": [
+                {
+                    key: value
+                    for key, value in metadata.items()
+                    if key not in {"query_token_ids", "key_token_ids"}
+                }
+                for metadata in chunk_metadata
+            ],
+        }
+
+    def _num_heads(self, block_files, layer_index):
         payload = torch.load(
-            self.block_files[layer_index][0], map_location="cpu", weights_only=True
+            block_files[layer_index][0], map_location="cpu", weights_only=True
         )
         return int(payload["attention"].shape[0])
 
-    def _save_layer_csvs(self, layer_index, num_heads, history_token_ids):
+    def _save_layer_csvs(
+        self,
+        output_dir,
+        block_files,
+        chunk_metadata,
+        layer_index,
+        num_heads,
+        history_token_ids,
+    ):
         payloads = [
             torch.load(path, map_location="cpu", weights_only=True)
-            for path in self.block_files[layer_index]
+            for path in block_files[layer_index]
         ]
         history_lookup = {
             tuple(token): index for index, token in enumerate(history_token_ids)
         }
         for head_index in range(num_heads):
-            csv_path = self.output_dir / f"l{layer_index:02d}h{head_index:02d}.csv"
+            csv_path = output_dir / f"l{layer_index:02d}h{head_index:02d}.csv"
             with csv_path.open("w", buffering=1024 * 1024) as handle:
-                for metadata, payload in zip(self.chunk_metadata, payloads):
+                for metadata, payload in zip(chunk_metadata, payloads):
                     block = payload["attention"][head_index].float().numpy()
                     columns = [
                         history_lookup[tuple(token)]

@@ -106,11 +106,13 @@ class VA_Server:
                 write_summary=job_config.rank == 0,
                 experiment_name=getattr(job_config, 'prompt', 'prompt-action'),
                 chunk_tokens=job_config.attention_chunk_tokens,
+                step_indices=getattr(job_config, 'attention_step_indices', None),
             )
             self.transformer.set_attention_recorder(self.attention_recorder)
             logger.info(
                 f"Enable joint attention analysis for layers "
                 f"{attention_layers} on rank {job_config.rank}; "
+                f"steps={getattr(job_config, 'attention_step_indices', None)}; "
                 f"output={attention_output}")
         shard_fn = shard_model
         self.transformer = _configure_model(model=self.transformer,
@@ -531,7 +533,9 @@ class VA_Server:
                     self._repeat_input_for_cfg(input_dict['latent_res_lst']),
                     update_cache=1 if last_step else 0,
                     cache_name=self.cache_name,
-                    action_mode=False)
+                    action_mode=False,
+                    attention_step_index=i,
+                    attention_timestep=t)
 
                 if not last_step or video_step != -1:
                     video_noise_pred = data_seq_to_patch(
@@ -730,6 +734,14 @@ def run(args):
         ]
     config.attention_output = args.attention_output
     config.attention_chunk_tokens = args.attention_chunk_tokens
+    if args.attention_timesteps is None:
+        config.attention_step_indices = None
+    else:
+        config.attention_step_indices = sorted({
+            int(step.strip())
+            for step in args.attention_timesteps.split(',')
+            if step.strip()
+        })
     if config.attention_analysis:
         if config.infer_mode != 'i2va':
             raise ValueError("Attention analysis currently supports i2va mode only")
@@ -739,6 +751,25 @@ def run(args):
             raise ValueError("At least one attention layer is required")
         if config.attention_chunk_tokens <= 0:
             raise ValueError("attention_chunk_tokens must be positive")
+        if config.attention_step_indices is not None:
+            if not config.attention_step_indices:
+                raise ValueError("At least one attention timestep is required")
+            if any(step < 0 for step in config.attention_step_indices):
+                raise ValueError("attention timestep indices must be non-negative")
+            video_loop_steps = (
+                config.num_inference_steps + 1
+                if config.video_exec_step == -1 else
+                min(config.video_exec_step, config.num_inference_steps + 1)
+            )
+            invalid_steps = [
+                step for step in config.attention_step_indices
+                if step >= video_loop_steps
+            ]
+            if invalid_steps:
+                raise ValueError(
+                    f"attention timestep indices {invalid_steps} exceed "
+                    f"video loop length {video_loop_steps}"
+                )
     rank = int(os.getenv("RANK", 0))
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
@@ -817,6 +848,15 @@ def main():
         type=int,
         default=512,
         help='key-token chunk size for streaming attention extraction',
+    )
+    parser.add_argument(
+        "--attention-timesteps",
+        type=str,
+        default=None,
+        help=(
+            'comma-separated zero-based video denoising step indices; '
+            'default captures the legacy final pass'
+        ),
     )
     args = parser.parse_args()
     run(args)

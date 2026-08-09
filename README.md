@@ -248,6 +248,14 @@ CUDA_VISIBLE_DEVICES=1 NGPU=1 CONFIG_NAME='robotwin_i2av' \
 
 Outputs follow `attn-exp/<prompt-action-slug>/lXXhXX.csv`. CSV rows are chronological current-video Q tokens, columns are chronological video-history K tokens, and future keys that were unavailable to an earlier chunk are empty fields. `summary.json` records the logical matrix shape, chunk boundaries, and token coordinates. With all 30 layers and 24 heads, the run creates 720 CSV files.
 
+To capture selected video denoising step indices instead of only the legacy final pass, use `--attention-timesteps`. The indices are zero-based positions in the padded video denoising loop, and the actual scheduler value is recorded in `summary.json`:
+
+```bash
+--attention-timesteps 0,1,2
+```
+
+This writes `attn-exp/<prompt-action-slug>/step_000/lXXhXX.csv`, `step_001/lXXhXX.csv`, and `step_002/lXXhXX.csv`. Omitting the option preserves the previous behavior and captures the final `t=0` pass.
+
 
 ## Post-Training LingBot-VA
 
