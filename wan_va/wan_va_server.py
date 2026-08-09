@@ -78,10 +78,13 @@ class VA_Server:
             torch_device='cpu' if self.enable_offload else self.device,
         )
 
+        # FSDP2 requires one original dtype for the wrapped parameter groups.
+        # Keep checkpoint parameters in FP32; MixedPrecisionPolicy casts them to
+        # the runtime dtype during forward while preserving stable FP32 modules.
         self.transformer = load_transformer(
             os.path.join(job_config.wan22_pretrained_model_name_or_path,
                          'transformer'),
-            torch_dtype=self.dtype,
+            torch_dtype=torch.float32,
             torch_device=self.device,
             attn_mode="torch"
         )
