@@ -34,6 +34,7 @@ Stop instead of resetting or overwriting files when the local or remote checkout
 - Supported environment: Linux x86_64, Python 3.10, CUDA 12.1.
 - Manage dependencies with `uv`; keep `pyproject.toml` and `uv.lock` synchronized.
 - Reproducible H100 install: `uv sync --frozen`.
+- On `h100-server`, invoke repository Python commands with `uv run python` (not bare `python`, which may not exist in the remote shell).
 - Minimal dependency smoke test on H100:
   `uv run python -c "import torch, flash_attn; print(torch.__version__, torch.version.cuda, flash_attn.__version__)"`
 
