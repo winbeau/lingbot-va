@@ -74,3 +74,24 @@ Stop instead of resetting or overwriting files when the local or remote checkout
   ```
 
 - The density script defaults to three quarters of available CPUs, capped by the 30 layer tasks. Each output is named after its input directory, for example `attn-density-vv-10-6/step_004.csv`.
+
+## Cross-prompt extraction workflow
+
+- `--prompt` overrides the text prompt; each prompt is slugified into its own subdirectory under `--attention-output`, so multiple prompts can share one output root.
+- Keep the same RoboTwin initial observation and vary only the instruction text when comparing attention across prompts.
+- Layer counts below `world_size` are safe: ranks without an assigned layer skip `save()` instead of raising.
+- To extract layers `0,14,29` at step index `24` only, on six GPUs, run per prompt:
+
+  ```bash
+  cd /root/wenbiao_zhao/lingbot-va && \
+  CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 \
+  NGPU=6 CONFIG_NAME='robotwin_i2av' \
+  uv run bash script/run_launch_va_server_sync.sh \
+    --model-path /root/wenbiao_zhao/models/lingbot-va-posttrain-robotwin \
+    --num-chunks-to-infer 10 \
+    --attention-analysis \
+    --attention-layers 0,14,29 \
+    --attention-timesteps 24 \
+    --attention-output attn-exp-xprompt-3l-ts24 \
+    --prompt '<instruction text>'
+  ```

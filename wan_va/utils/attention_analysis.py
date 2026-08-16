@@ -215,6 +215,15 @@ class JointAttentionRecorder:
                     )
 
     def save(self):
+        if not self.layers:
+            # Rank with no assigned layers (layers < world_size): nothing
+            # to export, but keep the per-worker cleanup symmetric.
+            shutil.rmtree(self.blocks_dir)
+            try:
+                self.blocks_root.rmdir()
+            except OSError:
+                pass
+            return None
         if self.step_indices is None:
             groups = [
                 (None, self.block_files, self.chunk_metadata, self.output_dir)

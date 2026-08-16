@@ -887,6 +887,8 @@ def run(args):
         config.wan22_pretrained_model_name_or_path = args.model_path
     if args.num_chunks_to_infer is not None:
         config.num_chunks_to_infer = args.num_chunks_to_infer
+    if args.prompt is not None:
+        config.prompt = args.prompt
     config.attention_analysis = args.attention_analysis
     if args.attention_layers.strip().lower() == 'all':
         config.attention_layers = list(range(30))
@@ -1002,6 +1004,12 @@ def main():
         type=int,
         default=None,
         help='override the number of generated video-action chunks',
+    )
+    parser.add_argument(
+        "--prompt",
+        type=str,
+        default=None,
+        help='override the text prompt (cross-prompt attention runs)',
     )
     parser.add_argument(
         "--attention-analysis",
