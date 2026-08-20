@@ -11,6 +11,8 @@
 | Script | Purpose |
 |---|---|
 | `run_vv_sparsity.sh` | 提取第二阶段 i2va 的 VV top-p Sparsity；每个 layer 输出一个 head × chunk CSV。 |
+| `run_va_vv_sparsity.sh` | 在同一次第二阶段 video forward 中提取 VV/VA 联合 softmax 的 region-conditional Sparsity 与 raw region mass。 |
+| `run_va_vv_attention.sh` | 流式导出 step 24 的 VV/VA raw joint-softmax full attention matrix CSV。 |
 
 ## VV Sparsity Quick Start
 
@@ -75,4 +77,64 @@ attn-output/vv-sparsity-c10-s24/
 - 只允许 `robotwin_i2av` 等 i2va 路径；chunk 1 以后必须能看到 action-history keys，否则导出失败。
 - 默认 step `24` 是最后一次真正更新 video latent 的 forward；step `25` 是 cache-only。实际 shifted scheduler timestep 始终以 `summary.json` 为准。
 - chunk 0 尚无前序 action history，但仍保留为第 0 列；后续 chunk 会经过联合 video/action cache 校验。
-- compact 路径直接由 VV logits 在 GPU 上计算 video-only 条件 softmax；这与从全模态 softmax 中取 VV 后再次对 video keys 归一化在数学上等价。由于 compact 路径保留 fp64 累积而矩阵乘是 fp32，极少数恰好落在 0.9 边界的 query 可能出现 1 token 的数值级差异。
+- 旧 compact 路径直接由 VV logits 在 GPU 上计算 video-only 条件 softmax；这与从全模态 softmax 中取 VV 后再次对 video keys 归一化在数学上等价。由于 compact 路径保留 fp64 累积而矩阵乘是 fp32，极少数恰好落在 0.9 边界的 query 可能出现 1 token 的数值级差异。
+
+## Joint VA/VV extraction
+
+两个新入口共享一次 video-query 对全部可见 video/action keys 的 joint softmax：
+
+```bash
+uv run bash attn-scripts/run_va_vv_sparsity.sh \
+  --model-path /root/wenbiao_zhao/models/lingbot-va-posttrain-robotwin \
+  --prompt 'Grab the white mug and place it on the rack.' \
+  --chunks 2 --step 24 --layers 0,14,29 --heads 0,1 --gpus 2 \
+  --output attn-output/va-vv-sparsity-smoke
+
+uv run bash attn-scripts/run_va_vv_attention.sh \
+  --model-path /root/wenbiao_zhao/models/lingbot-va-posttrain-robotwin \
+  --prompt 'Grab the white mug and place it on the rack.' \
+  --chunks 2 --step 24 --layers 0,14,29 --heads 0,1 --gpus 2 \
+  --output attn-output/va-vv-attention-smoke
+```
+
+两个脚本也接受 `--prompts FILE`、`--master-port`、`--seed`、
+`--chunk-tokens`、`--config` 和 `--overwrite`。`--heads` 在 capture
+阶段裁剪 Q/K；选择 `0,11,23` 时，`summary.json` 和 matrix 文件名仍保留
+原始 head id（`h00`、`h11`、`h23`）。
+
+### Joint probability and compact metrics
+
+对每个 video query，两个 raw slice 共用同一分母：
+
+```text
+P(k | q) = exp(score(q,k)) / sum(all visible VV and VA keys)
+mass_R = sum(P_R)
+P_R_conditional = P_R / mass_R
+sparsity_R = 1 - k / N_R, where cumulative(P_R_conditional) >= 0.9
+```
+
+compact 输出为：
+
+```text
+<prompt>/summary.json
+<prompt>/_SUCCESS
+<prompt>/step_024/
+├── sparsity/{vv,va}/lXX.csv
+└── mass/{vv,va}/lXX.csv
+```
+
+每个 CSV 无表头，形状为 `selected_heads × chunks`。VA chunk 0 的
+Sparsity 为 `nan`，mass 为 `0`；每次 capture 都检查 `mass_VV + mass_VA ≈ 1`。
+
+### Full matrix output
+
+```text
+<prompt>/step_024/
+├── vv/lXXhYY.csv
+└── va/lXXhYY.csv
+```
+
+每个矩阵文件无表头并保持固定 logical width：可见 key 是数字，future/unavailable
+key 是空字段而不是 0。行是按 chunk 顺序拼接的当前 video Q，绘图使用
+`origin="upper"`，不翻转矩阵。默认 10 chunks、all layers、all heads 会输出
+720 个 VV 和 720 个 VA CSV；所有 writer 完成后才创建 `_SUCCESS`。

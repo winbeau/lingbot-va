@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import os
 import re
 import sys
@@ -54,6 +55,21 @@ def _parse_args() -> argparse.Namespace:
         help="Directory for <input-directory-name>.csv.",
     )
     parser.add_argument(
+        "--region",
+        choices=("vv", "va"),
+        default=None,
+        help=(
+            "Read one new dual-region matrix directory below --input-dir; "
+            "legacy direct lXXhYY.csv input remains the default."
+        ),
+    )
+    parser.add_argument(
+        "--summary",
+        type=Path,
+        default=None,
+        help="Optional VA/VV summary.json used to validate the selected region.",
+    )
+    parser.add_argument(
         "--processes",
         type=_positive_int,
         default=_default_processes(),
@@ -88,7 +104,9 @@ def _discover_layers(input_dir: Path) -> list[tuple[int, list[Path]]]:
     ]
 
 
-def _head_density_sum(path: Path) -> tuple[float, int]:
+def _head_density_sum(
+    path: Path, *, skip_empty_rows: bool = False
+) -> tuple[float, int]:
     try:
         attention = np.genfromtxt(
             path,
@@ -100,22 +118,32 @@ def _head_density_sum(path: Path) -> tuple[float, int]:
     except Exception as error:
         raise ValueError(f"Failed to read {path}: {error}") from error
 
+    valid_mask = ~np.isnan(attention)
+    if skip_empty_rows:
+        nonempty_rows = valid_mask.any(axis=-1)
+        attention = attention[nonempty_rows]
+        valid_mask = valid_mask[nonempty_rows]
+        if attention.shape[0] == 0:
+            return 0.0, 0
+
     # Empty future-key fields are invalid. The shared helper renormalizes each
-    # available VV row and applies the same top-p=0.9 sparsity definition used
-    # by the direct per-chunk recorder export.
+    # available region row and applies the same top-p=0.9 definition used by
+    # the direct per-chunk recorder export. VA chunk 0 has no available rows.
     try:
-        sparsity = top_p_sparsity_rows(attention, ~np.isnan(attention))
+        sparsity = top_p_sparsity_rows(attention, valid_mask)
     except ValueError as error:
         raise ValueError(f"{path}: {error}") from error
     return float(sparsity.sum()), int(sparsity.size)
 
 
-def _layer_density(task: tuple[int, list[Path]]) -> tuple[int, float]:
-    layer, paths = task
+def _layer_density(task: tuple[int, list[Path], bool]) -> tuple[int, float]:
+    layer, paths, skip_empty_rows = task
     density_sum = 0.0
     query_count = 0
     for path in paths:
-        head_sum, head_queries = _head_density_sum(path)
+        head_sum, head_queries = _head_density_sum(
+            path, skip_empty_rows=skip_empty_rows
+        )
         density_sum += head_sum
         query_count += head_queries
     return layer, density_sum / query_count
@@ -123,15 +151,43 @@ def _layer_density(task: tuple[int, list[Path]]) -> tuple[int, float]:
 
 def main() -> None:
     args = _parse_args()
-    input_dir = args.input_dir.resolve()
-    layer_tasks = _discover_layers(input_dir)
+    input_root = args.input_dir.resolve()
+    input_dir = input_root
+    if args.summary is not None:
+        summary_path = args.summary.resolve()
+        if not summary_path.is_file():
+            raise FileNotFoundError(f"Summary does not exist: {summary_path}")
+        summary = json.loads(summary_path.read_text())
+        if args.region is not None:
+            regions = set(summary.get("attention_key_regions", []))
+            if regions and args.region.upper() not in regions:
+                raise ValueError(
+                    f"Summary {summary_path} does not contain region {args.region}"
+                )
+    if args.region is not None:
+        candidate = input_root / args.region
+        if candidate.is_dir():
+            input_dir = candidate
+        elif input_root.name.lower() != args.region:
+            raise FileNotFoundError(
+                f"Region directory does not exist below {input_root}: {args.region}"
+            )
+    layer_tasks = [
+        (layer, paths, args.region == "va")
+        for layer, paths in _discover_layers(input_dir)
+    ]
     worker_count = min(args.processes, len(layer_tasks))
 
     with ProcessPoolExecutor(max_workers=worker_count) as executor:
         results = sorted(executor.map(_layer_density, layer_tasks))
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = args.output_dir / f"{input_dir.name}.csv"
+    output_name = (
+        input_root.parent.name
+        if args.region is not None and input_root.name.lower() == args.region
+        else input_root.name
+    )
+    output_path = args.output_dir / f"{output_name}.csv"
     temporary_path = output_path.with_suffix(output_path.suffix + ".tmp")
     with temporary_path.open("w", newline="") as handle:
         writer = csv.writer(handle)

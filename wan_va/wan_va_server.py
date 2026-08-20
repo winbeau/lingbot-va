@@ -121,6 +121,18 @@ class VA_Server:
                     job_config, 'attention_vv_chunk_sparsity', False
                 ),
                 expected_chunks=job_config.num_chunks_to_infer,
+                export_mode=getattr(
+                    job_config, 'attention_export_mode', None
+                ),
+                regions=getattr(
+                    job_config, 'attention_regions', ("VV",)
+                ),
+                head_indices=getattr(
+                    job_config, 'attention_heads', None
+                ),
+                overwrite=getattr(
+                    job_config, 'attention_overwrite', False
+                ),
             )
             self.transformer.set_attention_recorder(self.attention_recorder)
             vv_chunk_sparsity = getattr(
@@ -131,6 +143,9 @@ class VA_Server:
                 f"{attention_layers} on rank {job_config.rank}; "
                 f"steps={getattr(job_config, 'attention_step_indices', None)}; "
                 f"vv_chunk_sparsity={vv_chunk_sparsity}; "
+                f"export_mode={getattr(job_config, 'attention_export_mode', None)}; "
+                f"regions={getattr(job_config, 'attention_regions', None)}; "
+                f"heads={getattr(job_config, 'attention_heads', None)}; "
                 f"output={attention_output}")
         shard_fn = shard_model
         self.transformer = _configure_model(model=self.transformer,
@@ -913,8 +928,6 @@ class VA_Server:
 
             if self.attention_recorder is not None:
                 summary_path = self.attention_recorder.save()
-                if torch.distributed.is_initialized():
-                    torch.distributed.barrier()
                 if self.job_config.rank == 0:
                     logger.info(
                         f"Saved joint attention analysis to {summary_path}"
@@ -988,6 +1001,53 @@ def run(args):
     config.attention_output = args.attention_output
     config.attention_chunk_tokens = args.attention_chunk_tokens
     config.attention_vv_chunk_sparsity = args.attention_vv_chunk_sparsity
+    requested_mode = args.attention_export_mode.strip().lower().replace(
+        "_", "-"
+    )
+    if requested_mode == "legacy":
+        export_mode = (
+            "vv-chunk-sparsity"
+            if args.attention_vv_chunk_sparsity else "legacy-matrix"
+        )
+    elif requested_mode in {"legacy-matrix", "vv-chunk-sparsity", "matrix", "chunk-sparsity"}:
+        export_mode = requested_mode
+    else:
+        raise ValueError(f"Unknown --attention-export-mode: {args.attention_export_mode}")
+    if args.attention_vv_chunk_sparsity and export_mode != "vv-chunk-sparsity":
+        raise ValueError(
+            "--attention-vv-chunk-sparsity cannot be combined with a new "
+            "dual-region export mode"
+        )
+    config.attention_export_mode = export_mode
+    config.attention_vv_chunk_sparsity = export_mode == "vv-chunk-sparsity"
+    region_text = args.attention_regions
+    if region_text is None:
+        region_text = "VV,VA" if export_mode in {"matrix", "chunk-sparsity"} else "VV"
+    config.attention_regions = tuple(
+        region.strip().upper() for region in region_text.split(",") if region.strip()
+    )
+    if export_mode in {"matrix", "chunk-sparsity"}:
+        if config.attention_regions != ("VV", "VA"):
+            raise ValueError(
+                "dual-region exports require --attention-regions VV,VA"
+            )
+    elif config.attention_regions != ("VV",):
+        raise ValueError("legacy exports support only --attention-regions VV")
+    if args.attention_heads.strip().lower() == "all":
+        config.attention_heads = None
+    else:
+        config.attention_heads = sorted({
+            int(head.strip())
+            for head in args.attention_heads.split(",")
+            if head.strip()
+        })
+        if not config.attention_heads:
+            raise ValueError("At least one attention head is required")
+        if any(head < 0 or head >= 24 for head in config.attention_heads):
+            raise ValueError("attention heads must be in [0, 23]")
+        if export_mode not in {"matrix", "chunk-sparsity"}:
+            raise ValueError("head subsets require a dual-region export mode")
+    config.attention_overwrite = args.attention_overwrite
     config.inference_audit = args.inference_audit
     if args.inference_audit_layers.strip().lower() == 'all':
         config.inference_audit_layers = list(range(30))
@@ -1004,13 +1064,22 @@ def run(args):
     ):
         raise ValueError("inference audit layers must be in [0, 29]")
     if args.attention_timesteps is None:
-        config.attention_step_indices = None
+        config.attention_step_indices = (
+            [24]
+            if export_mode in {"matrix", "chunk-sparsity"}
+            else None
+        )
     else:
         config.attention_step_indices = sorted({
             int(step.strip())
             for step in args.attention_timesteps.split(',')
             if step.strip()
         })
+    if export_mode in {"matrix", "chunk-sparsity"} and not config.attention_analysis:
+        raise ValueError(
+            "--attention-export-mode matrix/chunk-sparsity requires "
+            "--attention-analysis"
+        )
     if config.attention_vv_chunk_sparsity and not config.attention_analysis:
         raise ValueError(
             "--attention-vv-chunk-sparsity requires --attention-analysis"
@@ -1021,6 +1090,10 @@ def run(args):
     ):
         raise ValueError(
             "VV chunk sparsity requires at least two chunks"
+        )
+    if export_mode in {"matrix", "chunk-sparsity"} and config.num_chunks_to_infer < 2:
+        raise ValueError(
+            "Dual VA/VV attention export requires at least two chunks"
         )
     if config.attention_analysis_only and not config.attention_analysis:
         raise ValueError(
@@ -1170,6 +1243,30 @@ def main():
             'write compact lXX.csv files with rows=heads and columns=chunks '
             'instead of full lXXhYY attention matrices'
         ),
+    )
+    parser.add_argument(
+        "--attention-export-mode",
+        type=str,
+        default='legacy',
+        choices=['legacy', 'legacy-matrix', 'vv-chunk-sparsity', 'matrix', 'chunk-sparsity'],
+        help='attention export mode; matrix/chunk-sparsity enable dual VA/VV output',
+    )
+    parser.add_argument(
+        "--attention-regions",
+        type=str,
+        default=None,
+        help='comma-separated key regions; dual mode requires VV,VA',
+    )
+    parser.add_argument(
+        "--attention-heads",
+        type=str,
+        default='all',
+        help="'all' or comma-separated original attention head indices",
+    )
+    parser.add_argument(
+        "--attention-overwrite",
+        action='store_true',
+        help='replace an existing attention output directory',
     )
     parser.add_argument(
         "--attention-timesteps",
