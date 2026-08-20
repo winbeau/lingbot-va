@@ -29,6 +29,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 uv run bash attn-scripts/run_vv_sparsity.sh \
   --model /root/wenbiao_zhao/models/lingbot-va-posttrain-robotwin \
   --prompts prompts.txt \
+  --num-prompts 2 \
   --chunks 10 \
   --step 24 \
   --layers all \
@@ -43,6 +44,7 @@ uv run bash attn-scripts/run_vv_sparsity.sh \
 - `--output DIR`：输出根目录；默认按 chunk 和 step 自动命名。
 - `--seed N`：每个 prompt 重置相同随机种子，默认 `0`。
 - `--prompt TEXT`：只跑一个 prompt，和 `--prompts FILE` 二选一。
+- `--num-prompts N`：使用 `--prompts FILE` 时只跑过滤后的前 `N` 条 prompt；空行和注释行不计数。省略时跑完整文件。
 
 脚本在一个进程组内依次运行全部 prompt，复用模型加载和初始 observation latent；提取模式不会保存中间 latents/actions，也不会解码 `demo.mp4`。
 
