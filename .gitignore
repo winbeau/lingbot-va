@@ -3,3 +3,7 @@ __pycache__/
 .venv/
 *.egg-info/
 .beaupi/
+attn-output/
+attn-exp*/
+attn-exp.zip
+train_out*/

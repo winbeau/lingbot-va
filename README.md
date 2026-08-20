@@ -300,6 +300,10 @@ ls -lh "$OUTPUT_DIR"
 
 For each query and head, the script renormalizes the available video-key probabilities, finds the minimum number `k` of tokens whose cumulative mass reaches 0.9, and computes `density = 1 - k / N`. Empty future-key fields are excluded from `N`. The final layer value averages this sparsity over all queries and heads. The process count defaults to three quarters of the available CPUs and is capped by the 30 layer tasks. The command creates `step_000.csv`, `step_004.csv`, `step_009.csv`, `step_014.csv`, `step_019.csv`, and `step_024.csv` in `attn-density-vv-10-6/`, each with columns `layer,density`.
 
+#### Cross-prompt VV sparsity CSVs
+
+The compact second-stage VV extractor supports configurable chunks, steps, and layers, reuses one model load across prompts, and writes one head × chunk CSV per layer without generating plots or full attention matrices. See [`attn-scripts/README.md`](attn-scripts/README.md) for the maintained entry point and output contract.
+
 
 ## Post-Training LingBot-VA
 

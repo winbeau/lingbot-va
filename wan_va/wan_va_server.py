@@ -54,6 +54,9 @@ class VA_Server:
         )
         self.inference_audit_layers = list(
             getattr(job_config, 'inference_audit_layers', [0]))
+        self.attention_analysis_only = bool(
+            getattr(job_config, 'attention_analysis_only', False)
+        )
         self._audit_forward_index = 0
 
         self.scheduler = FlowMatchScheduler(shift=self.job_config.snr_shift,
@@ -114,12 +117,20 @@ class VA_Server:
                 experiment_name=getattr(job_config, 'prompt', 'prompt-action'),
                 chunk_tokens=job_config.attention_chunk_tokens,
                 step_indices=getattr(job_config, 'attention_step_indices', None),
+                vv_chunk_sparsity=getattr(
+                    job_config, 'attention_vv_chunk_sparsity', False
+                ),
+                expected_chunks=job_config.num_chunks_to_infer,
             )
             self.transformer.set_attention_recorder(self.attention_recorder)
+            vv_chunk_sparsity = getattr(
+                job_config, 'attention_vv_chunk_sparsity', False
+            )
             logger.info(
                 f"Enable joint attention analysis for layers "
                 f"{attention_layers} on rank {job_config.rank}; "
                 f"steps={getattr(job_config, 'attention_step_indices', None)}; "
+                f"vv_chunk_sparsity={vv_chunk_sparsity}; "
                 f"output={attention_output}")
         shard_fn = shard_model
         self.transformer = _configure_model(model=self.transformer,
@@ -475,8 +486,9 @@ class VA_Server:
 
         self.exp_name = f"{prompt}_{time.strftime('%Y%m%d_%H%M%S')}" if prompt else "default"
         self.exp_save_root = os.path.join(self.save_root, 'real', self.exp_name)
-        os.makedirs(self.exp_save_root, exist_ok=True)
-        torch.cuda.empty_cache()
+        if not self.attention_analysis_only:
+            os.makedirs(self.exp_save_root, exist_ok=True)
+            torch.cuda.empty_cache()
 
     @staticmethod
     def _audit_scalar(value):
@@ -551,8 +563,9 @@ class VA_Server:
     def _infer(self, obs, frame_st_id=0):
         frame_chunk_size = self.job_config.frame_chunk_size
         if frame_st_id == 0:
-            init_latent = self._encode_obs(obs)
-            self.init_latent = init_latent
+            if self.init_latent is None:
+                self.init_latent = self._encode_obs(obs)
+            init_latent = self.init_latent
 
         latents = torch.randn(1,
                               48,
@@ -722,10 +735,14 @@ class VA_Server:
 
                 actions[:, :, 0:1] = action_cond if frame_st_id == 0 else actions[:, :, 0:1]
 
-        actions[:, ~self.action_mask] *= 0
+        if self.attention_analysis_only:
+            return None, latents
 
-        save_async(latents, os.path.join(self.exp_save_root, f'latents_{frame_st_id}.pt'))
-        save_async(actions, os.path.join(self.exp_save_root, f'actions_{frame_st_id}.pt'))
+        actions[:, ~self.action_mask] *= 0
+        save_async(latents, os.path.join(
+            self.exp_save_root, f'latents_{frame_st_id}.pt'))
+        save_async(actions, os.path.join(
+            self.exp_save_root, f'actions_{frame_st_id}.pt'))
 
         actions = self.postprocess_action(actions)
         torch.cuda.empty_cache()
@@ -840,42 +857,107 @@ class VA_Server:
     
     @torch.no_grad()
     def generate(self):
-        self.video_processor = VideoProcessor(vae_scale_factor=1)
-        self._reset(self.job_config.prompt)
+        prompts = list(getattr(
+            self.job_config, 'prompts', [self.job_config.prompt]))
+        if not prompts:
+            raise ValueError("At least one generation prompt is required")
+        if not self.attention_analysis_only:
+            self.video_processor = VideoProcessor(vae_scale_factor=1)
+
         init_obs = self.load_init_obs()
-        pred_latent_lst = []
-        pred_action_lst = []
-        for chunk_id in range(self.job_config.num_chunks_to_infer):
-            actions, latents = self._infer(init_obs, frame_st_id=(chunk_id * self.job_config.frame_chunk_size))
-            actions = torch.from_numpy(actions)
-            pred_latent_lst.append(latents)
-            pred_action_lst.append(actions)
-        pred_latent = torch.cat(pred_latent_lst, dim=2)
-        pred_action = torch.cat(pred_action_lst, dim=1).flatten(1)
-        if self.attention_recorder is not None:
-            summary_path = self.attention_recorder.save()
-            if torch.distributed.is_initialized():
-                torch.distributed.barrier()
-            if self.job_config.rank == 0:
-                logger.info(f"Saved joint attention analysis to {summary_path}")
-        self.transformer.clear_cache(self.cache_name)
-        self.streaming_vae.clear_cache()
-        if self.streaming_vae_half:
-            self.streaming_vae_half.clear_cache()
+        cached_init_latent = None
+        seen_attention_dirs = set()
+        final_pred_latent = None
+        for prompt_index, prompt in enumerate(prompts):
+            if self.attention_recorder is not None:
+                if prompt_index > 0:
+                    self.attention_recorder.start_experiment(prompt)
+                output_dir = self.attention_recorder.output_dir.resolve()
+                if output_dir in seen_attention_dirs:
+                    raise ValueError(
+                        f"Prompt slug collision for attention output: {output_dir}"
+                    )
+                seen_attention_dirs.add(output_dir)
+
+            if getattr(self.job_config, 'attention_analysis', False):
+                attention_seed = int(getattr(
+                    self.job_config, 'attention_seed', 0))
+                torch.manual_seed(attention_seed)
+                torch.cuda.manual_seed_all(attention_seed)
+            logger.info(
+                f"Generate prompt {prompt_index + 1}/{len(prompts)}: {prompt}"
+            )
+            self._reset(prompt)
+            if cached_init_latent is None:
+                self.init_latent = self._encode_obs(init_obs)
+                cached_init_latent = self.init_latent.detach().clone()
+            else:
+                self.init_latent = cached_init_latent.clone()
+            if getattr(self.job_config, 'attention_analysis', False):
+                # Prompt/observation preprocessing must not shift generation noise.
+                torch.manual_seed(attention_seed)
+                torch.cuda.manual_seed_all(attention_seed)
+
+            pred_latent_lst = []
+            for chunk_id in range(self.job_config.num_chunks_to_infer):
+                _, latents = self._infer(
+                    init_obs,
+                    frame_st_id=(
+                        chunk_id * self.job_config.frame_chunk_size
+                    ),
+                )
+                if not self.attention_analysis_only:
+                    pred_latent_lst.append(latents)
+            if pred_latent_lst:
+                final_pred_latent = torch.cat(pred_latent_lst, dim=2)
+
+            if self.attention_recorder is not None:
+                summary_path = self.attention_recorder.save()
+                if torch.distributed.is_initialized():
+                    torch.distributed.barrier()
+                if self.job_config.rank == 0:
+                    logger.info(
+                        f"Saved joint attention analysis to {summary_path}"
+                    )
+            self.transformer.clear_cache(self.cache_name)
+            self.streaming_vae.clear_cache()
+            if self.streaming_vae_half:
+                self.streaming_vae_half.clear_cache()
+
         del self.transformer
         del self.streaming_vae_half
         del self.text_encoder
         torch.cuda.empty_cache()
-        
-        if self.job_config.rank != 0:
-            return
 
-        # Move VAE to GPU for decoding
+        if self.attention_analysis_only or self.job_config.rank != 0:
+            return
+        if final_pred_latent is None:
+            raise RuntimeError("Generation produced no video latent")
+
+        # Move VAE to GPU for decoding.
         if self.enable_offload:
             self.vae = self.vae.to(self.device).to(self.dtype)
 
-        decoded_video = self.decode_one_video(pred_latent, 'np')[0]
-        export_to_video(decoded_video, os.path.join(self.save_root, "demo.mp4"), fps=10)
+        decoded_video = self.decode_one_video(final_pred_latent, 'np')[0]
+        export_to_video(
+            decoded_video,
+            os.path.join(self.save_root, "demo.mp4"),
+            fps=10,
+        )
+
+
+def _read_prompts_file(path):
+    prompts = []
+    with open(path) as handle:
+        for line in handle:
+            prompt = line.rstrip("\r\n")
+            if not prompt.strip() or prompt.lstrip().startswith("#"):
+                continue
+            prompts.append(prompt)
+    if not prompts:
+        raise ValueError(f"No prompts found in {path}")
+    return prompts
+
 
 def run(args):    
     
@@ -887,9 +969,16 @@ def run(args):
         config.wan22_pretrained_model_name_or_path = args.model_path
     if args.num_chunks_to_infer is not None:
         config.num_chunks_to_infer = args.num_chunks_to_infer
-    if args.prompt is not None:
-        config.prompt = args.prompt
+    if args.prompts_file is not None:
+        config.prompts = _read_prompts_file(args.prompts_file)
+    elif args.prompt is not None:
+        config.prompts = [args.prompt]
+    else:
+        config.prompts = [config.prompt]
+    config.prompt = config.prompts[0]
     config.attention_analysis = args.attention_analysis
+    config.attention_analysis_only = args.attention_analysis_only
+    config.attention_seed = args.attention_seed
     if args.attention_layers.strip().lower() == 'all':
         config.attention_layers = list(range(30))
     else:
@@ -898,6 +987,7 @@ def run(args):
         ]
     config.attention_output = args.attention_output
     config.attention_chunk_tokens = args.attention_chunk_tokens
+    config.attention_vv_chunk_sparsity = args.attention_vv_chunk_sparsity
     config.inference_audit = args.inference_audit
     if args.inference_audit_layers.strip().lower() == 'all':
         config.inference_audit_layers = list(range(30))
@@ -921,6 +1011,25 @@ def run(args):
             for step in args.attention_timesteps.split(',')
             if step.strip()
         })
+    if config.attention_vv_chunk_sparsity and not config.attention_analysis:
+        raise ValueError(
+            "--attention-vv-chunk-sparsity requires --attention-analysis"
+        )
+    if (
+        config.attention_vv_chunk_sparsity
+        and config.num_chunks_to_infer < 2
+    ):
+        raise ValueError(
+            "VV chunk sparsity requires at least two chunks"
+        )
+    if config.attention_analysis_only and not config.attention_analysis:
+        raise ValueError(
+            "--attention-analysis-only requires --attention-analysis"
+        )
+    if len(config.prompts) > 1 and not config.attention_analysis_only:
+        raise ValueError(
+            "Multiple prompts require --attention-analysis-only"
+        )
     if config.attention_analysis:
         if config.infer_mode != 'i2va':
             raise ValueError("Attention analysis currently supports i2va mode only")
@@ -928,6 +1037,8 @@ def run(args):
             raise ValueError("num_chunks_to_infer must be positive")
         if not config.attention_layers:
             raise ValueError("At least one attention layer is required")
+        if any(layer < 0 or layer >= 30 for layer in config.attention_layers):
+            raise ValueError("attention layers must be in [0, 29]")
         if config.attention_chunk_tokens <= 0:
             raise ValueError("attention_chunk_tokens must be positive")
         if config.attention_step_indices is not None:
@@ -956,9 +1067,9 @@ def run(args):
     config.rank = rank
     config.local_rank = local_rank
     config.world_size = world_size
-    if config.attention_analysis and world_size > 1:
-        torch.manual_seed(0)
-        torch.cuda.manual_seed_all(0)
+    if config.attention_analysis:
+        torch.manual_seed(config.attention_seed)
+        torch.cuda.manual_seed_all(config.attention_seed)
     model = VA_Server(config)
     if config.infer_mode == 'i2va':
         logger.info(f"******************************USE I2AV mode******************************")
@@ -1005,16 +1116,34 @@ def main():
         default=None,
         help='override the number of generated video-action chunks',
     )
-    parser.add_argument(
+    prompt_group = parser.add_mutually_exclusive_group()
+    prompt_group.add_argument(
         "--prompt",
         type=str,
         default=None,
         help='override the text prompt (cross-prompt attention runs)',
     )
+    prompt_group.add_argument(
+        "--prompts-file",
+        type=str,
+        default=None,
+        help='text file with one prompt per line for one-process extraction',
+    )
     parser.add_argument(
         "--attention-analysis",
         action='store_true',
-        help='capture concatenated video-to-video history attention CSVs',
+        help='capture video-to-video attention analysis CSVs',
+    )
+    parser.add_argument(
+        "--attention-analysis-only",
+        action='store_true',
+        help='skip inference artifacts and video decode after attention export',
+    )
+    parser.add_argument(
+        "--attention-seed",
+        type=int,
+        default=0,
+        help='reset this RNG seed for every attention-analysis prompt',
     )
     parser.add_argument(
         "--attention-layers",
@@ -1033,6 +1162,14 @@ def main():
         type=int,
         default=512,
         help='key-token chunk size for streaming attention extraction',
+    )
+    parser.add_argument(
+        "--attention-vv-chunk-sparsity",
+        action='store_true',
+        help=(
+            'write compact lXX.csv files with rows=heads and columns=chunks '
+            'instead of full lXXhYY attention matrices'
+        ),
     )
     parser.add_argument(
         "--attention-timesteps",

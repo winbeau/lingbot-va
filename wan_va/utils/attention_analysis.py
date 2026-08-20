@@ -8,6 +8,8 @@ from pathlib import Path
 
 import torch
 
+from .attention_sparsity import TOP_P, TOP_P_TOLERANCE
+
 
 @torch.no_grad()
 def compute_token_probability_slice(
@@ -72,8 +74,51 @@ def compute_token_probability_slice(
     ).unsqueeze(-1)
 
 
+@torch.no_grad()
+def compute_token_sparsity_slice(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    query_mask: torch.Tensor,
+    key_slice_mask: torch.Tensor,
+    softmax_scale: float | None = None,
+) -> torch.Tensor:
+    """Compute mean top-p VV sparsity per head directly from VV logits.
+
+    The existing metric renormalizes the VV slice over video keys, so the full
+    multimodal softmax denominator cancels exactly. This path therefore needs
+    one VV score matrix and returns only a [H] vector.
+    """
+    if query.ndim != 3 or key.ndim != 3:
+        raise ValueError(f"query/key must be [L,H,D], got {query.shape}/{key.shape}")
+    if query_mask.ndim != 1 or key_slice_mask.ndim != 1:
+        raise ValueError("query_mask and key_slice_mask must be one-dimensional")
+    if query.shape[0] != query_mask.numel() or key.shape[0] != key_slice_mask.numel():
+        raise ValueError("Token and mask lengths do not match")
+    if softmax_scale is None:
+        softmax_scale = query.shape[-1] ** -0.5
+
+    query_mask = query_mask.to(query.device, dtype=torch.bool)
+    key_slice_mask = key_slice_mask.to(key.device, dtype=torch.bool)
+    selected_query = query[query_mask].float().transpose(0, 1)
+    selected_key = key[key_slice_mask].float().transpose(0, 1)
+    if selected_query.shape[1] == 0 or selected_key.shape[1] == 0:
+        raise ValueError("The requested query/key slice is empty")
+
+    scores = torch.matmul(selected_query, selected_key.transpose(-2, -1))
+    scores.mul_(softmax_scale)
+    sorted_scores = scores.sort(dim=-1, descending=True).values.double()
+    sorted_scores.sub_(sorted_scores[..., :1])
+    weights = sorted_scores.exp_()
+    weights.div_(weights.sum(dim=-1, keepdim=True))
+    cumulative = weights.cumsum(dim=-1)
+    reached = cumulative >= TOP_P - TOP_P_TOLERANCE
+    tokens_needed = torch.argmax(reached.to(torch.int32), dim=-1) + 1
+    sparsity = 1.0 - tokens_needed.double() / selected_key.shape[1]
+    return sparsity.mean(dim=-1)
+
+
 class JointAttentionRecorder:
-    """Write one concatenated current-Q/history-K CSV per layer and head."""
+    """Capture VV attention as full matrices or per-chunk sparsity CSVs."""
 
     def __init__(
         self,
@@ -86,24 +131,46 @@ class JointAttentionRecorder:
         summary_layers=None,
         write_summary=True,
         step_indices=None,
+        vv_chunk_sparsity=False,
+        expected_chunks=None,
     ):
         self.output_root = Path(output_dir)
-        self.output_dir = self.output_root / _slugify(experiment_name)
         self.layers = set(layers)
         self.summary_layers = sorted(
             set(self.layers if summary_layers is None else summary_layers)
         )
         self.batch_index = batch_index
         self.chunk_tokens = chunk_tokens
-        self.blocks_root = self.output_dir / ".attention-blocks"
-        self.blocks_dir = self.blocks_root / f"worker_{worker_id:02d}"
-        self.blocks_dir.mkdir(parents=True, exist_ok=True)
+        self.worker_id = int(worker_id)
         self.write_summary = write_summary
-        self.step_indices = (
-            None if step_indices is None else sorted(set(int(step) for step in step_indices))
+        self.vv_chunk_sparsity = bool(vv_chunk_sparsity)
+        self.expected_chunks = (
+            None if expected_chunks is None else int(expected_chunks)
         )
-        if self.step_indices is not None and any(step < 0 for step in self.step_indices):
+        if self.expected_chunks is not None and self.expected_chunks <= 0:
+            raise ValueError("Expected attention chunk count must be positive")
+        self.step_indices = (
+            None
+            if step_indices is None
+            else sorted(set(int(step) for step in step_indices))
+        )
+        if self.step_indices is not None and any(
+            step < 0 for step in self.step_indices
+        ):
             raise ValueError("Attention step indices must be non-negative")
+        self._saved = True
+        self.start_experiment(experiment_name)
+
+    def start_experiment(self, experiment_name):
+        """Reset recorder state for another prompt after the prior save."""
+        if not self._saved:
+            raise RuntimeError(
+                "Cannot start a new attention experiment before saving the current one"
+            )
+        self.output_dir = self.output_root / _slugify(experiment_name)
+        self.blocks_root = self.output_dir / ".attention-blocks"
+        self.blocks_dir = self.blocks_root / f"worker_{self.worker_id:02d}"
+        self.blocks_dir.mkdir(parents=True, exist_ok=True)
         if self.step_indices is None:
             self.block_files = {layer: [] for layer in self.layers}
             self.chunk_metadata = []
@@ -113,6 +180,7 @@ class JointAttentionRecorder:
                 for step in self.step_indices
             }
             self.chunk_metadata = {step: [] for step in self.step_indices}
+        self._saved = False
 
     @torch.no_grad()
     def capture(
@@ -159,28 +227,37 @@ class JointAttentionRecorder:
             raise ValueError("Video query has no visible video-history key")
 
         batch_index = min(self.batch_index, query.shape[0] - 1)
-        probabilities = compute_token_probability_slice(
-            query=query[batch_index],
-            key=key[batch_index],
-            query_mask=current_video_query,
-            key_slice_mask=visible_video_history,
-            chunk_tokens=self.chunk_tokens,
-        ).cpu()
-
         chunk_index = len(block_files[layer_index])
-        step_dir = (
-            self.blocks_dir
-            if capture_step is None
-            else self.blocks_dir / f"step_{capture_step:03d}"
-        )
-        layer_dir = step_dir / f"layer_{layer_index:02d}"
-        layer_dir.mkdir(parents=True, exist_ok=True)
-        block_path = layer_dir / f"chunk_{chunk_index:03d}.pt"
-        torch.save({"attention": probabilities}, block_path)
-        block_files[layer_index].append(block_path)
+        if self.vv_chunk_sparsity:
+            head_sparsity = compute_token_sparsity_slice(
+                query=query[batch_index],
+                key=key[batch_index],
+                query_mask=current_video_query,
+                key_slice_mask=visible_video_history,
+            )
+            block_files[layer_index].append(head_sparsity)
+        else:
+            probabilities = compute_token_probability_slice(
+                query=query[batch_index],
+                key=key[batch_index],
+                query_mask=current_video_query,
+                key_slice_mask=visible_video_history,
+                chunk_tokens=self.chunk_tokens,
+            ).cpu()
+            step_dir = (
+                self.blocks_dir
+                if capture_step is None
+                else self.blocks_dir / f"step_{capture_step:03d}"
+            )
+            layer_dir = step_dir / f"layer_{layer_index:02d}"
+            layer_dir.mkdir(parents=True, exist_ok=True)
+            block_path = layer_dir / f"chunk_{chunk_index:03d}.pt"
+            torch.save({"attention": probabilities}, block_path)
+            block_files[layer_index].append(block_path)
 
-        query_ids = _video_token_ids(query_frame_ids[current_video_query])
-        key_ids = _video_token_ids(key_frame_ids[visible_video_history])
+        query_frames = query_frame_ids[current_video_query]
+        query_tokens = int(query_frames.numel())
+        visible_video_tokens = int(visible_video_history.sum().item())
         timestep_value = None
         if attention_timestep is not None:
             if isinstance(attention_timestep, torch.Tensor):
@@ -191,24 +268,36 @@ class JointAttentionRecorder:
             "chunk_index": chunk_index,
             "step_index": step_index,
             "scheduler_timestep": timestep_value,
-            "query_token_ids": query_ids,
-            "key_token_ids": key_ids,
-            "query_tokens": len(query_ids),
-            "visible_video_history_tokens": len(key_ids),
+            "query_tokens": query_tokens,
+            "visible_video_history_tokens": visible_video_tokens,
+            "visible_action_history_tokens": int(
+                (key_token_types == 1).sum().item()
+            ),
             "all_key_tokens_in_softmax": int(key.shape[1]),
-            "query_frame_start": min(token[0] for token in query_ids),
-            "query_frame_end": max(token[0] for token in query_ids) + 1,
+            "query_frame_start": int(query_frames.min().item()),
+            "query_frame_end": int(query_frames.max().item()) + 1,
             "cache_name": cache_name,
         }
+        if not self.vv_chunk_sparsity:
+            metadata["query_token_ids"] = _video_token_ids(query_frames)
+            metadata["key_token_ids"] = _video_token_ids(
+                key_frame_ids[visible_video_history]
+            )
         if chunk_index == len(chunk_metadata):
             chunk_metadata.append(metadata)
         else:
             expected = chunk_metadata[chunk_index]
-            for field in (
-                "query_token_ids",
-                "key_token_ids",
+            fields = [
+                "query_tokens",
+                "visible_video_history_tokens",
+                "visible_action_history_tokens",
                 "all_key_tokens_in_softmax",
-            ):
+                "query_frame_start",
+                "query_frame_end",
+            ]
+            if not self.vv_chunk_sparsity:
+                fields.extend(["query_token_ids", "key_token_ids"])
+            for field in fields:
                 if metadata[field] != expected[field]:
                     raise ValueError(
                         f"Layer {layer_index} chunk {chunk_index} has inconsistent {field}"
@@ -223,6 +312,7 @@ class JointAttentionRecorder:
                 self.blocks_root.rmdir()
             except OSError:
                 pass
+            self._saved = True
             return None
         if self.step_indices is None:
             groups = [
@@ -258,31 +348,65 @@ class JointAttentionRecorder:
             )
             for step, block_files, chunk_metadata, output_dir in groups
         ]
-        common_summary = {
-            "semantics": (
-                "rows concatenate each chunk's current-video Q; columns are "
-                "chronological video-history K; softmax denominators include "
-                "all KV modalities visible at that chunk"
-            ),
-            "step_index_semantics": (
-                "zero-based index in the padded video denoising loop; "
-                "scheduler_timestep stores the actual scheduler value"
-            ),
-            "csv_header": False,
-            "future_columns": "empty CSV fields",
-            "layer_indices": self.summary_layers,
-            "chunk_tokens": self.chunk_tokens,
-        }
+        if self.vv_chunk_sparsity:
+            common_summary = {
+                "semantics": (
+                    "each layer CSV stores second-stage i2va video-to-video "
+                    "top-p sparsity; rows are heads and columns are chunks; "
+                    "the video-only softmax is mathematically equivalent to "
+                    "renormalizing the VV slice of the full multimodal softmax"
+                ),
+                "attention_region": "VV",
+                "source_phase": "i2va video denoising forward",
+                "joint_stage_validation": (
+                    "every chunk after chunk 0 contains action-history keys "
+                    "in the full multimodal softmax"
+                ),
+                "step_index_semantics": (
+                    "zero-based index in the padded video denoising loop; "
+                    "scheduler_timestep stores the actual scheduler value"
+                ),
+                "csv_header": False,
+                "csv_rows": "attention heads in ascending index order",
+                "csv_columns": "generated chunks in ascending index order",
+                "sparsity_top_p": TOP_P,
+                "sparsity_formula": "1 - k / N",
+                "sparsity_reduction": (
+                    "mean over current-video query tokens within each chunk"
+                ),
+                "layer_indices": self.summary_layers,
+                "compute_path": "direct GPU VV logits with float64 accumulation",
+            }
+            csv_pattern = "lXX.csv"
+            step_csv_pattern = "step_XXX/lXX.csv"
+        else:
+            common_summary = {
+                "semantics": (
+                    "rows concatenate each chunk's current-video Q; columns "
+                    "are chronological video-history K; softmax denominators "
+                    "include all KV modalities visible at that chunk"
+                ),
+                "step_index_semantics": (
+                    "zero-based index in the padded video denoising loop; "
+                    "scheduler_timestep stores the actual scheduler value"
+                ),
+                "csv_header": False,
+                "future_columns": "empty CSV fields",
+                "layer_indices": self.summary_layers,
+                "chunk_tokens": self.chunk_tokens,
+            }
+            csv_pattern = "lXXhXX.csv"
+            step_csv_pattern = "step_XXX/lXXhXX.csv"
         if self.step_indices is None:
             summary = {
                 **common_summary,
-                "csv_pattern": "lXXhXX.csv",
+                "csv_pattern": csv_pattern,
                 **step_summaries[0],
             }
         else:
             summary = {
                 **common_summary,
-                "csv_pattern": "step_XXX/lXXhXX.csv",
+                "csv_pattern": step_csv_pattern,
                 "requested_step_indices": self.step_indices,
                 "steps": step_summaries,
             }
@@ -295,6 +419,7 @@ class JointAttentionRecorder:
             self.blocks_root.rmdir()
         except OSError:
             pass
+        self._saved = True
         return summary_path
 
     def _save_group(
@@ -312,6 +437,18 @@ class JointAttentionRecorder:
         chunk_count = len(chunk_metadata)
         if any(len(block_files[layer]) != chunk_count for layer in layer_indices):
             raise RuntimeError("Attention layers captured different numbers of chunks")
+        if self.expected_chunks is not None and chunk_count != self.expected_chunks:
+            raise RuntimeError(
+                f"Captured {chunk_count} attention chunks; expected "
+                f"{self.expected_chunks}"
+            )
+        chunk_indices = [
+            int(metadata["chunk_index"]) for metadata in chunk_metadata
+        ]
+        if chunk_indices != list(range(chunk_count)):
+            raise RuntimeError(
+                f"Attention chunks are not contiguous: {chunk_indices}"
+            )
 
         step_indices = {metadata["step_index"] for metadata in chunk_metadata}
         scheduler_timesteps = {
@@ -319,6 +456,44 @@ class JointAttentionRecorder:
         }
         if len(step_indices) != 1 or len(scheduler_timesteps) != 1:
             raise RuntimeError("Attention chunks have inconsistent timestep metadata")
+
+        step_index = next(iter(step_indices))
+        scheduler_timestep = next(iter(scheduler_timesteps))
+        num_heads = self._num_heads(block_files, layer_indices[0])
+        output_dir.mkdir(parents=True, exist_ok=True)
+        public_chunks = [
+            {
+                key: value
+                for key, value in metadata.items()
+                if key not in {"query_token_ids", "key_token_ids"}
+            }
+            for metadata in chunk_metadata
+        ]
+
+        if self.vv_chunk_sparsity:
+            self._validate_joint_vv_chunks(chunk_metadata)
+            for layer_index in layer_indices:
+                self._save_layer_sparsity_csv(
+                    output_dir=output_dir,
+                    block_files=block_files,
+                    layer_index=layer_index,
+                    num_heads=num_heads,
+                    chunk_count=chunk_count,
+                )
+            return {
+                "requested_step_index": requested_step,
+                "step_index": step_index,
+                "scheduler_timestep": scheduler_timestep,
+                "csv_directory": str(
+                    output_dir.relative_to(self.output_dir) or "."
+                ),
+                "csv_shape_per_layer": [num_heads, chunk_count],
+                "num_heads": num_heads,
+                "num_chunks": chunk_count,
+                "chunk_indices": chunk_indices,
+                "joint_stage_verified": True,
+                "chunks": public_chunks,
+            }
 
         row_token_ids = [
             token
@@ -329,9 +504,6 @@ class JointAttentionRecorder:
             metadata["key_token_ids"] for metadata in chunk_metadata
         )
         logical_shape = [len(row_token_ids), len(history_token_ids)]
-        num_heads = self._num_heads(block_files, layer_indices[0])
-        output_dir.mkdir(parents=True, exist_ok=True)
-
         for layer_index in layer_indices:
             self._save_layer_csvs(
                 output_dir=output_dir,
@@ -344,8 +516,8 @@ class JointAttentionRecorder:
 
         return {
             "requested_step_index": requested_step,
-            "step_index": next(iter(step_indices)),
-            "scheduler_timestep": next(iter(scheduler_timesteps)),
+            "step_index": step_index,
+            "scheduler_timestep": scheduler_timestep,
             "csv_directory": str(output_dir.relative_to(self.output_dir) or "."),
             "logical_shape_per_csv": logical_shape,
             "num_heads": num_heads,
@@ -358,21 +530,68 @@ class JointAttentionRecorder:
             "history_chunk_boundaries": _history_boundaries(
                 chunk_metadata, history_token_ids
             ),
-            "chunks": [
-                {
-                    key: value
-                    for key, value in metadata.items()
-                    if key not in {"query_token_ids", "key_token_ids"}
-                }
-                for metadata in chunk_metadata
-            ],
+            "chunks": public_chunks,
         }
 
+    def _validate_joint_vv_chunks(self, chunk_metadata):
+        if len(chunk_metadata) < 2:
+            raise RuntimeError(
+                "At least two chunks are required to verify second-stage VV "
+                "attention"
+            )
+        missing_action_history = [
+            int(metadata["chunk_index"])
+            for metadata in chunk_metadata[1:]
+            if int(metadata["visible_action_history_tokens"]) <= 0
+        ]
+        if missing_action_history:
+            raise RuntimeError(
+                "VV chunk sparsity requires the second-stage i2va cache; "
+                "no action-history keys were visible in chunks "
+                f"{missing_action_history}"
+            )
+
     def _num_heads(self, block_files, layer_index):
+        if self.vv_chunk_sparsity:
+            return int(block_files[layer_index][0].shape[0])
         payload = torch.load(
             block_files[layer_index][0], map_location="cpu", weights_only=True
         )
+        if "attention" not in payload:
+            raise RuntimeError("Attention block is missing required key 'attention'")
         return int(payload["attention"].shape[0])
+
+    def _save_layer_sparsity_csv(
+        self,
+        output_dir,
+        block_files,
+        layer_index,
+        num_heads,
+        chunk_count,
+    ):
+        chunk_values = []
+        for values in block_files[layer_index]:
+            values = values.double()
+            if values.shape != (num_heads,):
+                raise RuntimeError(
+                    f"Layer {layer_index} has invalid chunk sparsity shape "
+                    f"{tuple(values.shape)}; expected {(num_heads,)}"
+                )
+            chunk_values.append(values)
+        matrix = torch.stack(chunk_values, dim=1).cpu()
+        if matrix.shape != (num_heads, chunk_count):
+            raise RuntimeError(
+                f"Layer {layer_index} has invalid sparsity matrix shape "
+                f"{tuple(matrix.shape)}"
+            )
+
+        csv_path = output_dir / f"l{layer_index:02d}.csv"
+        temporary_path = csv_path.with_suffix(csv_path.suffix + ".tmp")
+        with temporary_path.open("w") as handle:
+            for row in matrix.tolist():
+                handle.write(",".join(f"{float(value):.9g}" for value in row))
+                handle.write("\n")
+        temporary_path.replace(csv_path)
 
     def _save_layer_csvs(
         self,

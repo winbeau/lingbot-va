@@ -11,11 +11,6 @@ LOG_RANK=${LOG_RANK:-"0"}
 TORCHFT_LIGHTHOUSE=${TORCHFT_LIGHTHOUSE:-"http://localhost:29510"}
 CONFIG_NAME=${CONFIG_NAME:-"robotwin"}
 
-overrides=""
-if [ $# -ne 0 ]; then
-    overrides="$*"
-fi
-
 ## node setting
 num_gpu=${NGPU}
 master_port=${MASTER_PORT}
@@ -31,4 +26,4 @@ python -m torch.distributed.run \
     --local-ranks-filter=${log_rank} \
     --master_port ${master_port} \
     --tee 3 \
-    -m wan_va.wan_va_server --config-name ${config_name} $overrides
+    -m wan_va.wan_va_server --config-name "${config_name}" "$@"

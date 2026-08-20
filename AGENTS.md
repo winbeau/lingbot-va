@@ -40,6 +40,7 @@ Stop instead of resetting or overwriting files when the local or remote checkout
 
 ## Attention extraction and density workflow
 
+- The maintained attention-script index is [`attn-scripts/README.md`](attn-scripts/README.md). Add every new extraction or analysis entry point there, using `run_<target>_<metric>.sh`, `compute_<metric>.py`, or `inspect_<artifact>.py` naming.
 - Treat the current `robotwin_i2av` execution path and `lingbot-va-posttrain-robotwin` checkpoint as LingBot-VA 1.0-style velocity FlowMatch inference, not the LingBot-VA 2.0 distilled student. The VA2 student checkpoint and deployment sampler are not wired into this repository path.
 - RoboTwin video inference performs 25 denoising updates at zero-based step indices `0..24`, then appends step index `25` at scheduler timestep `0` as a cache-only Transformer forward. Step `25` still executes VV attention but does not call `scheduler.step()` or update the video latent.
 - Use `summary.json`, not the step index alone, as the source of truth for the actual shifted scheduler timestep.
@@ -80,7 +81,8 @@ Stop instead of resetting or overwriting files when the local or remote checkout
 - `--prompt` overrides the text prompt; each prompt is slugified into its own subdirectory under `--attention-output`, so multiple prompts can share one output root.
 - Keep the same RoboTwin initial observation and vary only the instruction text when comparing attention across prompts.
 - Layer counts below `world_size` are safe: ranks without an assigned layer skip `save()` instead of raising.
-- To extract layers `0,14,29` at step index `24` only, on six GPUs, run per prompt:
+- For the maintained compact cross-prompt VV Sparsity CSV workflow, use [`attn-scripts/README.md`](attn-scripts/README.md). It supports one-process multi-prompt extraction, configurable chunks/steps/layers, and skips full attention matrices.
+- To extract full attention matrices for layers `0,14,29` at step index `24` only, on six GPUs, run per prompt:
 
   ```bash
   cd /root/wenbiao_zhao/lingbot-va && \

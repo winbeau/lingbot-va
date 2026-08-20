@@ -7,13 +7,19 @@ import argparse
 import csv
 import os
 import re
+import sys
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import numpy as np
 
-TOP_P = 0.9
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from wan_va.utils.attention_sparsity import top_p_sparsity_rows  # noqa: E402
+
 ATTENTION_CSV = re.compile(r"^l(?P<layer>\d+)h(?P<head>\d+)\.csv$")
 
 
@@ -94,33 +100,14 @@ def _head_density_sum(path: Path) -> tuple[float, int]:
     except Exception as error:
         raise ValueError(f"Failed to read {path}: {error}") from error
 
-    valid = ~np.isnan(attention)
-    valid_tokens = valid.sum(axis=1)
-    if np.any(valid_tokens == 0):
-        row = int(np.flatnonzero(valid_tokens == 0)[0])
-        raise ValueError(f"{path}: query row {row} has no available key tokens")
-
-    present = attention[valid]
-    if np.any(~np.isfinite(present)):
-        raise ValueError(f"{path}: attention contains non-finite values")
-    if np.any(present < 0):
-        raise ValueError(f"{path}: attention contains negative values")
-
-    values = np.nan_to_num(attention, nan=0.0)
-    row_mass = values.sum(axis=1)
-    if np.any(row_mass <= 0):
-        row = int(np.flatnonzero(row_mass <= 0)[0])
-        raise ValueError(f"{path}: query row {row} has zero attention mass")
-
-    # The recorder keeps the full multimodal softmax denominator while writing
-    # only video keys. Renormalize each available video-to-video row so top-p is
-    # measured over the video tokens represented by this CSV.
-    probabilities = values / row_mass[:, None]
-    probabilities.sort(axis=1)
-    cumulative = np.cumsum(probabilities[:, ::-1], axis=1)
-    tokens_needed = np.argmax(cumulative >= TOP_P - 1e-12, axis=1) + 1
-    density = 1.0 - tokens_needed / valid_tokens
-    return float(density.sum()), int(density.size)
+    # Empty future-key fields are invalid. The shared helper renormalizes each
+    # available VV row and applies the same top-p=0.9 sparsity definition used
+    # by the direct per-chunk recorder export.
+    try:
+        sparsity = top_p_sparsity_rows(attention, ~np.isnan(attention))
+    except ValueError as error:
+        raise ValueError(f"{path}: {error}") from error
+    return float(sparsity.sum()), int(sparsity.size)
 
 
 def _layer_density(task: tuple[int, list[Path]]) -> tuple[int, float]:
