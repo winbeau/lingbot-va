@@ -213,6 +213,8 @@ def main() -> None:
             if label:
                 diag["plan_override"] = {"label": label}
             calls.append({"call_index": c + 1, "step_index": steps, "metadata": {"diagnostics": diag}})
+            if os.environ.get("CS_VERBOSE"):
+                print(f"  {eid} call {c} step {steps} model {diag['model_seconds']:.1f}s", flush=True)
             key_frames = []
             t1 = time.monotonic()
             start_idx = 1 if first else 0
