@@ -98,7 +98,8 @@ def main() -> None:
     shadow_arm = None
     if args.shadow_arm:
         raw = args.shadow_arm
-        shadow_arm = CaseStudyArm.parse(yaml.safe_load(Path(raw).read_text()) if Path(raw).exists() else json.loads(raw))
+        doc = yaml.safe_load(Path(raw).read_text()) if Path(raw).exists() else json.loads(raw)
+        shadow_arm = CaseStudyArm.parse(doc.get("casestudy", doc) if isinstance(doc, dict) else doc)
     plans = json.loads(Path(args.plans).read_text()) if args.plans else {}
 
     init_distributed(1, 0, 0)
