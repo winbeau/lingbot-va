@@ -582,23 +582,28 @@ class VA_Server:
                 self.init_latent = self._encode_obs(obs)
             init_latent = self.init_latent
 
+        # Case study: noise from a generator seeded per call (None keeps the global RNG).
+        cs_seed = getattr(self, "cs_seed", None)
+        generator = None if cs_seed is None else torch.Generator(device=self.device).manual_seed(int(cs_seed))
         latents = torch.randn(1,
                               48,
                               frame_chunk_size,
                               self.latent_height,
                               self.latent_width,
                               device=self.device,
-                              dtype=self.dtype)
+                              dtype=self.dtype,
+                              generator=generator)
         actions = torch.randn(1,
                               self.job_config.action_dim,
                               frame_chunk_size,
                               self.action_per_frame,
                               1,
                               device=self.device,
-                              dtype=self.dtype)
+                              dtype=self.dtype,
+                              generator=generator)
 
-        video_inference_step = self.job_config.num_inference_steps
-        action_inference_step = self.job_config.action_num_inference_steps
+        video_inference_step = getattr(self, "cs_video_steps", None) or self.job_config.num_inference_steps
+        action_inference_step = getattr(self, "cs_action_steps", None) or self.job_config.action_num_inference_steps
         video_step = self.job_config.video_exec_step
 
         self.scheduler.set_timesteps(video_inference_step)
@@ -634,7 +639,7 @@ class VA_Server:
                 torch.no_grad(),
         ):
             # 1. Video Generation Loop
-            for i, t in enumerate(tqdm(timesteps)):
+            for i, t in enumerate(tqdm(timesteps, disable=getattr(self, "cs_controller", None) is not None)):
                 last_step = i == len(timesteps) - 1
                 update_cache = 1 if last_step else 0
                 will_update = not last_step or video_step != -1
@@ -691,7 +696,10 @@ class VA_Server:
 
                 latents[:, :, 0:1] = latent_cond if frame_st_id == 0 else latents[:, :, 0:1]
 
-            for i, t in enumerate(tqdm(action_timesteps)):
+            controller = getattr(self, "cs_controller", None)
+            if controller is not None:
+                controller.active = True
+            for i, t in enumerate(tqdm(action_timesteps, disable=controller is not None)):
                 last_step = i == len(action_timesteps) - 1
                 update_cache = 1 if last_step else 0
                 will_update = not last_step
@@ -749,15 +757,18 @@ class VA_Server:
                                                          return_dict=False)
 
                 actions[:, :, 0:1] = action_cond if frame_st_id == 0 else actions[:, :, 0:1]
+            if controller is not None:
+                controller.active = False
 
         if self.attention_analysis_only:
             return None, latents
 
         actions[:, ~self.action_mask] *= 0
-        save_async(latents, os.path.join(
-            self.exp_save_root, f'latents_{frame_st_id}.pt'))
-        save_async(actions, os.path.join(
-            self.exp_save_root, f'actions_{frame_st_id}.pt'))
+        if not getattr(self.job_config, "casestudy_no_dump", False):
+            save_async(latents, os.path.join(
+                self.exp_save_root, f'latents_{frame_st_id}.pt'))
+            save_async(actions, os.path.join(
+                self.exp_save_root, f'actions_{frame_st_id}.pt'))
 
         actions = self.postprocess_action(actions)
         torch.cuda.empty_cache()
@@ -766,7 +777,8 @@ class VA_Server:
     def _compute_kv_cache(self, obs):
         ### optional async save obs for debug
         self.transformer.clear_pred_cache(self.cache_name)
-        save_async(obs['obs'], os.path.join(self.exp_save_root, f'obs_data_{self.frame_st_id}.pt'))
+        if not getattr(self.job_config, "casestudy_no_dump", False):
+            save_async(obs['obs'], os.path.join(self.exp_save_root, f'obs_data_{self.frame_st_id}.pt'))
         latent_model_input = self._encode_obs(obs)
         if self.frame_st_id == 0:
             latent_model_input = torch.cat(

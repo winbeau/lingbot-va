@@ -29,8 +29,11 @@ from functools import partial
 
 try:
     from flash_attn_interface import flash_attn_func
-except:
-    from flash_attn import flash_attn_func
+except ImportError:
+    try:
+        from flash_attn import flash_attn_func
+    except ImportError:  # only needed for attn_mode="flash"; eval uses "torch" (SDPA)
+        flash_attn_func = None
 
 __all__ = ['WanTransformer3DModel']
 
@@ -493,6 +496,16 @@ class WanAttention(torch.nn.Module):
             value = value_pool[:, valid]
             key_token_types = self.attn_caches[cache_name]['token_type'][valid]
             key_frame_ids = self.attn_caches[cache_name]['frame_id'][valid]
+            # Sparse-acceleration case study: restrict what action queries see of the
+            # current chunk's predicted video (no-op unless a controller is installed).
+            casestudy = getattr(self, "casestudy", None)
+            if casestudy is not None and token_type == 1:
+                keep = casestudy.restrict(
+                    self.casestudy_layer_index, query, key, valid, key_token_types,
+                    self.attn_caches[cache_name]['is_pred'][valid])
+                if keep is not None:
+                    key, value = key[:, keep], value[:, keep]
+                    key_token_types, key_frame_ids = key_token_types[keep], key_frame_ids[keep]
 
         if inference_trace is not None:
             def token_count(token_types, value):
