@@ -10,6 +10,7 @@ the KV cache, vertical image flip only, 128x128 cameras. Differences, all record
 * ``env.seed(--seed)`` as in the action-eval LIBERO backend;
 * per-call noise seeded by (instruction, episode without repeat, call index);
 * the case-study arm (``wan_va/casestudy.py``), optional shadow arm and episode plans;
+* single process without torch.distributed (bf16 weights cast once, no FSDP wrapper);
 * records in the action-eval run layout (episodes/<id>/accepted.json + attempts/0001/
   result.json, policy-calls.json, actions.npy, sim_states.npy), so the shared analysis
   scripts read them unchanged.
@@ -85,7 +86,6 @@ def main() -> None:
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ["MASTER_PORT"] = str(args.master_port)
 
-    from distributed.util import init_distributed
     from wan_va.configs import VA_CONFIGS
     from wan_va.casestudy import (CaseStudyArm, CaseStudyController, call_seed, install,
                                   restore_caches, snapshot_caches)
@@ -102,7 +102,10 @@ def main() -> None:
         shadow_arm = CaseStudyArm.parse(doc.get("casestudy", doc) if isinstance(doc, dict) else doc)
     plans = json.loads(Path(args.plans).read_text()) if args.plans else {}
 
-    init_distributed(1, 0, 0)
+    # torch.distributed is deliberately NOT initialized: with no process group,
+    # distributed.util._configure_model casts the fp32 checkpoint to bf16 once instead of
+    # wrapping it in FSDP2, whose mixed-precision policy re-casts every parameter to the
+    # same bf16 values on every forward (~70 forwards per call). Same weights, no re-cast.
     config = VA_CONFIGS["libero"]
     config.wan22_pretrained_model_name_or_path = args.model_path
     config.save_root = str(Path(args.run_dir) / ".lingbot_tmp")
