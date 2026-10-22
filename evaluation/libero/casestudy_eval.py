@@ -77,6 +77,8 @@ def main() -> None:
     ap.add_argument("--suite", default="libero_10")
     ap.add_argument("--tasks", type=int, nargs="+", default=list(range(10)))
     ap.add_argument("--inits", type=int, nargs="+", default=list(range(50)))
+    ap.add_argument("--episodes", nargs="+", default=None,
+                    help="tNNN-iMMM pairs instead of the --tasks x --inits grid (case replays)")
     ap.add_argument("--repeats", type=int, default=1)
     ap.add_argument("--cap", type=int, default=400)
     ap.add_argument("--seed", type=int, default=42)
@@ -129,11 +131,15 @@ def main() -> None:
 
     run_dir = Path(args.run_dir)
     run_dir.mkdir(parents=True, exist_ok=True)
+    if args.episodes:
+        pairs = sorted({(int(e[1:4]), int(e.split("-i")[1][:3])) for e in args.episodes})
+    else:
+        pairs = [(t, i) for t in args.tasks for i in args.inits]
     if args.shard == 0:
         resolved = {
             "experiment": {"name": f"{args.run_name}-{arm_doc.get('name')}-{args.suite}"},
             "benchmark": {"suite": args.suite, "task_ids": args.tasks, "initial_state_indices": args.inits,
-                          "repeats": args.repeats},
+                          "episode_subset": args.episodes, "repeats": args.repeats},
             "protocol": {"id": "sparse-casestudy-lingbot-v1", "max_steps": args.cap, "wait_steps": 5,
                          "resolution": [128, 128], "replan_steps": "native (12 first call, then 16)",
                          "seed": args.seed},
@@ -144,12 +150,12 @@ def main() -> None:
         _atomic(run_dir / "resolved.yaml", yaml.safe_dump(resolved, sort_keys=False).encode())
         episodes = [{"episode_id": f"t{t:03d}-i{i:03d}-r{r:02d}-s{args.seed}", "task_id": t, "init_index": i,
                      "repeat": r, "seed": args.seed}
-                    for t in args.tasks for i in args.inits for r in range(args.repeats)]
+                    for t, i in pairs for r in range(args.repeats)]
         _atomic(run_dir / "manifest.json", json.dumps({"schema_version": "lingbot-casestudy/v1",
                                                          "episodes": episodes}, indent=1).encode())
 
     bench = benchmark.get_benchmark_dict()[args.suite]()
-    plan_list = [(t, i, r) for t in args.tasks for i in args.inits for r in range(args.repeats)]
+    plan_list = [(t, i, r) for t, i in pairs for r in range(args.repeats)]
     mine = [x for k, x in enumerate(plan_list) if k % args.num_shards == args.shard]
     envs: dict[int, object] = {}
 
