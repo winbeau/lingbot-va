@@ -80,6 +80,10 @@ def main() -> None:
     ap.add_argument("--episodes", nargs="+", default=None,
                     help="tNNN-iMMM pairs instead of the --tasks x --inits grid (case replays)")
     ap.add_argument("--repeats", type=int, default=1)
+    ap.add_argument("--reset-history-workers", type=int, default=None,
+                    help="reproduce the per-env reset count of a reference run with this many workers: "
+                         "(position of the init in --inits) // N resets before the episode's own (action-eval "
+                         "benchmark.reset_history_workers); some LIBERO fixtures move with every reset")
     ap.add_argument("--cap", type=int, default=400)
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--arm-file", required=True)
@@ -158,6 +162,7 @@ def main() -> None:
     plan_list = [(t, i, r) for t, i in pairs for r in range(args.repeats)]
     mine = [x for k, x in enumerate(plan_list) if k % args.num_shards == args.shard]
     envs: dict[int, object] = {}
+    resets: dict[int, int] = {}
 
     def arm_for(plan: dict, call_index: int) -> tuple[CaseStudyArm, str | None]:
         calls = plan.get("calls") or {}
@@ -181,14 +186,24 @@ def main() -> None:
         if (ep_dir / "accepted.json").exists():
             continue
         prompt = bench.get_task(task).language
+        make_env = lambda: OffScreenRenderEnv(bddl_file_name=bench.get_task_bddl_file_path(task),
+                                              camera_heights=128, camera_widths=128)
         if task not in envs:
-            envs[task] = OffScreenRenderEnv(bddl_file_name=bench.get_task_bddl_file_path(task),
-                                            camera_heights=128, camera_widths=128)
+            envs[task], resets[task] = make_env(), 0
+        if args.reset_history_workers:
+            target = args.inits.index(init) // args.reset_history_workers
+            if resets[task] > target:
+                envs[task].close()
+                envs[task], resets[task] = make_env(), 0
+            while resets[task] < target:
+                envs[task].reset()
+                resets[task] += 1
         env = envs[task]
         init_states = bench.get_task_init_states(task)
         started = time.monotonic()
         env.seed(episode_scene_seed(args.seed, task, init))
         env.reset()
+        resets[task] += 1
         env.set_init_state(init_states[init % init_states.shape[0]])
         for _ in range(5):
             raw, _, _, _ = env.step([0.0] * 7)
@@ -269,6 +284,11 @@ def main() -> None:
         _npy(att / "sim_states.npy", np.stack(sim_states))
         _npy(att / "final_sim_state.npy", np.asarray(env.get_sim_state(), dtype=np.float64))
         _atomic(att / "policy-calls.json", json.dumps(calls, indent=1).encode())
+        # First policy observation, hashed like action-eval's policy-inputs.json (pairing checks).
+        _atomic(att / "policy-inputs.json", json.dumps([{"images": {
+            "agentview": {"sha256": hashlib.sha256(first_obs["observation.images.agentview_rgb"].tobytes()).hexdigest()},
+            "wrist": {"sha256": hashlib.sha256(first_obs["observation.images.eye_in_hand_rgb"].tobytes()).hexdigest()}},
+            "step_index": 0}], indent=1).encode())
         _atomic(att / "result.json", json.dumps(result, indent=1).encode())
         _atomic(ep_dir / "accepted.json", json.dumps({"attempt": 1, "status": status}).encode())
         print(f"[{'OK  ' if done else 'FAIL'}] {eid} steps={steps} calls={len(calls)} "
