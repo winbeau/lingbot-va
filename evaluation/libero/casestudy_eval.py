@@ -7,7 +7,10 @@ actions (the first call skips latent frame 0), one key frame per latent frame fe
 the KV cache, vertical image flip only, 128x128 cameras. Differences, all recorded:
 
 * step cap ``--cap`` counts policy steps after the init steps (case-study protocol: 400);
-* ``env.seed(--seed)`` as in the action-eval LIBERO backend;
+* scene seeded per episode as in the action-eval LIBERO backend (``scene_seed: episode``):
+  LIBERO re-samples fixture positions from its global numpy RNG on every reset and
+  ``set_init_state`` does not restore them, so the env is reseeded before each reset from
+  (seed, task, init) and an episode's scene does not depend on the shard or episode order;
 * per-call noise seeded by (instruction, episode without repeat, call index);
 * the case-study arm (``wan_va/casestudy.py``), optional shadow arm and episode plans;
 * single process without torch.distributed (bf16 weights cast once, no FSDP wrapper);
@@ -22,6 +25,7 @@ the KV cache, vertical image flip only, 128x128 cameras. Differences, all record
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -37,6 +41,11 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "wan_va"))  # the server imports `distributed` relative to wan_va/
 
+
+def episode_scene_seed(seed: int, task_id: int, init_index: int) -> int:
+    """Scene RNG seed of one episode (same formula as action-eval's LIBERO backend)."""
+    digest = hashlib.sha256(f"{seed}|{task_id}|{init_index}".encode()).digest()
+    return int.from_bytes(digest[:4], "little") & 0x7FFFFFFF
 
 def _atomic(path: Path, payload: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -169,10 +178,10 @@ def main() -> None:
         if task not in envs:
             envs[task] = OffScreenRenderEnv(bddl_file_name=bench.get_task_bddl_file_path(task),
                                             camera_heights=128, camera_widths=128)
-            envs[task].seed(args.seed)
         env = envs[task]
         init_states = bench.get_task_init_states(task)
         started = time.monotonic()
+        env.seed(episode_scene_seed(args.seed, task, init))
         env.reset()
         env.set_init_state(init_states[init % init_states.shape[0]])
         for _ in range(5):
